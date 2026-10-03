@@ -1,218 +1,180 @@
-# tg-shorts-bot — Implementation Plan (CLAUDE.md)
+# tg-shorts-bot
 
-A Telegram bot that sits in a group chat, notices YouTube Shorts / Instagram Reels / TikTok links,
-downloads the video and posts it back into the chat as a reply to the original message.
+A Telegram bot that sits in a friends' group chat, notices YouTube Shorts / Instagram Reels & posts / TikTok links,
+downloads the media and posts it back into the chat as a reply to the original message.
 
 - **Language:** plain Java 25 (no Spring, no DI framework). Small, well-known libraries only.
-- **Run:** `docker compose up -d` — one command, nothing else to install on the host.
-- **VPN (later phase):** optional, off by default, toggled by `VPN_ENABLED=true` + an Outline `ss://` key.
+- **Run (target):** `docker compose up -d`, one command, nothing else to install on the host (phase 6).
+- **VPN (phase 7):** optional, off by default, toggled by `VPN_ENABLED=true` + an Outline `ss://` key.
 
-Each phase ends with a **Checkpoint** — a concrete thing that must work before moving on.
+## Status
+
+| Phase | What | State |
+|---|---|---|
+| 1 | Gradle skeleton | ✅ done |
+| 2 | Config + Telegram long polling | ✅ done, verified in the test group |
+| 3 | Link detection | ✅ done, verified with real links |
+| 4 | Downloading with yt-dlp | ✅ done, verified with real links |
+| 5 | Sending to the chat, cache, errors, concurrency | ✅ done, verified in the test group |
+| 5b | Instagram `/p/` posts: photos/albums + post text | ✅ done, verified in the test group |
+| 6 | Dockerfile + docker-compose + README | ⏳ next |
+| 7 | Outline / Shadowsocks VPN toggle | planned |
+| 8 | Hardening & polish | planned |
+
+Each phase is one commit (fixes found while testing a phase go into that phase's commit or a follow-up).
+Tests must stay green. Push to GitHub only when the user asks.
 
 ---
 
-## 0. Key decisions (and why)
+## Working on this repo
+
+- Build + all tests: `./gradlew build` → `build/libs/tg-shorts-bot.jar` (shadow/fat jar). ~90 unit tests, no network.
+- The host has Java 25 but **no yt-dlp/ffmpeg** and no Gradle install (the wrapper downloads Gradle).
+  Until phase 6 exists, real downloads/bot runs use a throwaway image built from:
+  ```dockerfile
+  FROM eclipse-temurin:25-jre
+  ARG TARGETARCH
+  RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl && rm -rf /var/lib/apt/lists/* \
+   && if [ "$TARGETARCH" = "arm64" ]; then f=yt-dlp_linux_aarch64; else f=yt-dlp_linux; fi \
+   && curl -fsSL -o /usr/local/bin/yt-dlp "https://github.com/yt-dlp/yt-dlp/releases/latest/download/$f" && chmod +x /usr/local/bin/yt-dlp
+  ```
+  - Debug downloads: `docker run --rm -v "$PWD":/w -w /w <image> java -cp build/libs/tg-shorts-bot.jar dev.shortsbot.DownloadCli <url>...`
+    (saves to `downloads/`, git-ignored; prints items, sizes, dimensions and post text).
+  - Run the bot: `docker run -d --name shortsbot-dev-run --env-file .env -v <jar>:/app/tg-shorts-bot.jar:ro <image> java -jar /app/tg-shorts-bot.jar`.
+    Don't rebuild a jar that a running JVM uses; copy it elsewhere or restart the bot.
+- `.env` holds the real `BOT_TOKEN` and `ALLOWED_CHAT_IDS` (test group `-5230348538`, a basic group; if Telegram
+  converts it to a supergroup the id changes to `-100…` and the bot logs "Ignoring messages from chat …").
+  `.env`, `cookies.txt`, `secrets/` are git-ignored and must never be committed.
+- Bot: `@jaccob_bot`. Privacy mode is already disabled in @BotFather.
+
+---
+
+## Key decisions (and why)
 
 | Concern | Decision | Reason |
 |---|---|---|
-| Telegram API | `org.telegram:telegrambots-longpolling` + `telegrambots-client` (v9.x) | Mature, plain Java, OkHttp-based → easy to route through a SOCKS proxy later. Long polling = no public URL/HTTPS needed. |
-| Downloading | `yt-dlp` CLI called via `ProcessBuilder` | The only reliable, constantly maintained extractor for all three sites. Reimplementing in Java is a losing battle. |
-| Muxing / re-encoding | `ffmpeg` (used by yt-dlp) | yt-dlp needs it to merge separate video+audio streams into one mp4. |
-| Build | Gradle (Kotlin DSL `build.gradle.kts`), fat jar via the Shadow plugin (`com.gradleup.shadow`); Gradle Wrapper (`gradlew`) committed; dependency versions in `gradle/libs.versions.toml` | No Gradle installed locally; wrapper + multi-stage Docker build means the host needs only Docker. |
-| Config | Environment variables (`.env` file read by compose) | Simple, 12-factor, works the same locally and in Docker. |
-| Logging | SLF4J + Logback, console output | `docker compose logs` is the log viewer. |
-| VPN | `sslocal` (shadowsocks-rust) bundled in the image, started by the Java app as a child process when enabled; exposes SOCKS5 on `127.0.0.1:1080` | Outline keys are plain Shadowsocks. One container, one toggle, no compose profiles needed. Java just talks to a local SOCKS5 proxy. |
+| Telegram API | `org.telegram:telegrambots-longpolling` + `telegrambots-client` **10.3.0** | Mature, plain Java, OkHttp-based → easy to route through a SOCKS proxy. Long polling = no public URL needed. |
+| Downloading | `yt-dlp` CLI via `ProcessBuilder` | The only reliable, maintained extractor for all three sites. |
+| Muxing / probing | `ffmpeg` / `ffprobe` | yt-dlp merges video+audio with it; ffprobe fills in missing Instagram dimensions. |
+| Build | Gradle 9.8 (Kotlin DSL), Shadow plugin, wrapper committed, versions in `gradle/libs.versions.toml` | No Gradle installed locally; the wrapper plus a Docker build means the host only needs Docker. |
+| Config | Environment variables (`.env`) | Same locally and in Docker. |
+| Logging | SLF4J + Logback to console, level from `LOG_LEVEL` | `docker compose logs` is the log viewer. Message text is logged only at DEBUG. |
+| VPN | `sslocal` (shadowsocks-rust) in the image, started by Java when enabled; SOCKS5 on `127.0.0.1:1080` | Outline keys are plain Shadowsocks. One container, one toggle. |
 
-### Telegram-side prerequisites (manual, done by you)
-1. Create the bot with **@BotFather** → get `BOT_TOKEN`.
-2. **`/setprivacy` → Disable.** Otherwise in groups the bot only sees `/commands` and mentions and will never see links. (If the bot was already in the group, remove and re-add it after changing this.)
-3. Optional: `/setjoingroups` to control who can add it.
-4. Add the bot to the friends group. To get the group's chat id, the bot will log it on the first message (see phase 2).
-
-### Known limits to design around
-- **Bot API upload limit is 50 MB** (`sendVideo`). Shorts/Reels/TikToks are almost always far below this; we select ≤720p mp4 and reject/re-encode anything larger.
-- **Instagram** often requires a logged-in session → support an optional `cookies.txt` (Netscape format) mounted into the container.
-- **yt-dlp breaks when sites change** → image installs the latest yt-dlp at build time, plus an optional self-update on startup.
+Known limits: Bot API uploads are max **50 MB per video**, **10 MB per photo**, albums of **2–10** items,
+captions **1024** chars, messages **4096** chars. Instagram may require a login for some content → optional cookies file.
+yt-dlp breaks when sites change → it must be kept up to date (phase 6/8).
 
 ---
 
-## 1. Project skeleton
+## Architecture (as built)
 
-**Goal:** an empty runnable Java app that builds with Gradle and in Docker.
-
-Layout:
 ```
-tg-shorts-bot/
-├── settings.gradle.kts
-├── build.gradle.kts
-├── gradle/libs.versions.toml
-├── gradlew, gradlew.bat, gradle/wrapper/
-├── Dockerfile
-├── docker-compose.yml
-├── .env.example
-├── .gitignore            (.env, cookies.txt, build/, .gradle/, downloads/)
-├── README.md
-└── src/
-    ├── main/java/dev/shortsbot/
-    │   ├── Main.java
-    │   ├── DownloadCli.java                   (debug tool: download links with the bot's settings)
-    │   ├── config/BotConfig.java
-    │   ├── telegram/ShortsBot.java            (update consumer: filters, /help, dispatches links to workers)
-    │   ├── telegram/LinkProcessor.java        (cache → download w/ retry → upload → error reply)
-    │   ├── telegram/ChatGateway.java          (interface over the Telegram calls; faked in tests)
-    │   ├── telegram/TelegramChatGateway.java  (implementation, honors 429 retry_after)
-    │   ├── telegram/ReplyTarget.java, FailureMessages.java
-    │   ├── link/Platform.java                 (enum YOUTUBE, INSTAGRAM, TIKTOK)
-    │   ├── link/DetectedLink.java             (record: platform, url, canonicalId)
-    │   ├── link/LinkExtractor.java
-    │   ├── download/VideoDownloader.java      (interface)
-    │   ├── download/YtDlpDownloader.java
-    │   ├── download/DownloadResult.java       (record: file, width, height, duration, title)
-    │   ├── download/DownloadException.java
-    │   ├── cache/FileIdCache.java
-    │   └── proxy/ (phase 6)
-    │       ├── ShadowsocksUrl.java
-    │       └── ShadowsocksSidecar.java
-    ├── main/resources/logback.xml
-    └── test/java/dev/shortsbot/...
+src/main/java/dev/shortsbot/
+├── Main.java                       wiring, startup checks (yt-dlp version, getMe, privacy-mode warning), graceful shutdown
+├── DownloadCli.java                debug tool: download links with the bot's settings into downloads/
+├── config/BotConfig.java           record built from env, validation, secrets hidden in toString()
+├── config/ConfigException.java
+├── link/Platform.java              YOUTUBE, INSTAGRAM, TIKTOK
+├── link/DetectedLink.java          (platform, normalized url, canonicalId) + isInstagramPost()
+├── link/LinkExtractor.java         entities + regex scan → normalized, deduped links (max 5 per message)
+├── download/VideoDownloader.java   interface: download(link) → DownloadResult
+├── download/YtDlpDownloader.java   runs yt-dlp per job in its own temp dir, collects items, classifies errors
+├── download/DownloadResult.java    (items, caption, title, workDir); close() deletes workDir
+├── download/MediaItem.java         (type, file, size, width, height, duration)
+├── download/MediaType.java         VIDEO, PHOTO
+├── download/DownloadException.java reason: TOO_LONG, TOO_LARGE, NOT_A_VIDEO, LOGIN_REQUIRED, UNAVAILABLE, TIMEOUT, UNKNOWN
+├── cache/LruCache.java             generic thread-safe LRU (500 entries of SentPost)
+└── telegram/
+    ├── ShortsBot.java              update consumer: allow-list, ignore bots/edits, /help, dispatch links to worker pool
+    ├── LinkProcessor.java          cache → download (1 retry) → send → cache; caption rules; error replies
+    ├── ChatGateway.java            interface over Telegram calls (faked in tests)
+    ├── TelegramChatGateway.java    sendVideo / sendPhoto / sendMediaGroup / reply / chat action; honors 429 retry_after
+    ├── TelegramHttp.java           OkHttp client for API calls (30 s connect, 120 s read/write)
+    ├── ReplyTarget.java            chat id, forum topic id, message id to reply to
+    ├── OutgoingMedia.java          media to send: local file or Telegram file_id
+    ├── SentPost.java               cached file_ids + caption for a link
+    └── FailureMessages.java        short user-facing error texts
 ```
 
-Steps:
-1. `git init`, `.gitignore`.
-2. `settings.gradle.kts` (`rootProject.name = "tg-shorts-bot"`) and `build.gradle.kts`: plugins `application` + `com.gradleup.shadow`; Java toolchain 25; `application.mainClass = "dev.shortsbot.Main"`; dependencies (via version catalog) — `telegrambots-longpolling`, `telegrambots-client`, `slf4j-api`, `logback-classic`, `jackson-databind` (for yt-dlp JSON output); test — `junit-jupiter`, `assertj`, `tasks.test { useJUnitPlatform() }`. `shadowJar` produces `tg-shorts-bot.jar` (no classifier, no version suffix).
-3. Generate the Gradle Wrapper via a throwaway Docker container: `docker run --rm -v "$PWD":/w -w /w gradle:jdk25 gradle wrapper` (or `brew install gradle` once). Commit `gradlew`, `gradlew.bat`, `gradle/wrapper/*`.
-4. `Main.java` that loads config and logs "starting".
-
-**Checkpoint:** `./gradlew shadowJar` produces `build/libs/tg-shorts-bot.jar`; `java -jar` prints the start log.
-
----
-
-## 2. Configuration + minimal Telegram bot
-
-**Goal:** bot connects, receives group messages, logs them.
-
-`BotConfig` (immutable record, built from `System.getenv()` with validation and defaults):
+### Configuration (`.env.example` documents all of it)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BOT_TOKEN` | — (required) | From BotFather |
-| `ALLOWED_CHAT_IDS` | empty = allow all | Comma-separated chat ids; protects against strangers adding the bot |
-| `MAX_DURATION_SEC` | `180` | Skip videos longer than this |
-| `MAX_FILE_MB` | `49` | Hard cap under the 50 MB Bot API limit |
-| `DOWNLOAD_TIMEOUT_SEC` | `120` | Kill yt-dlp after this |
+| `BOT_TOKEN` | required | From BotFather |
+| `ALLOWED_CHAT_IDS` | empty = all | Comma-separated chat ids |
+| `MAX_DURATION_SEC` | `180` | Skip longer videos |
+| `MAX_FILE_MB` | `49` | Per-video cap (1–50) |
+| `DOWNLOAD_TIMEOUT_SEC` | `120` | Kill yt-dlp (and its ffmpeg children) after this |
 | `WORKER_THREADS` | `2` | Parallel downloads |
-| `DOWNLOAD_DIR` | `/tmp/shortsbot` | Temp working dir |
-| `YTDLP_PATH` | `yt-dlp` | Binary location |
-| `YTDLP_COOKIES_FILE` | empty | Optional cookies.txt (mainly Instagram) |
-| `YTDLP_AUTO_UPDATE` | `false` | Run `yt-dlp -U` on startup |
-| `REPLY_WITH_ERRORS` | `true` | Post a short "couldn't download" reply on failure |
-| `VPN_ENABLED` | `false` | Phase 6 |
-| `VPN_SS_URL` | empty | Phase 6, Outline `ss://…` (or `ssconf://…`) key |
-| `LOG_LEVEL` | `INFO` | |
+| `DOWNLOAD_DIR` | `/tmp/shortsbot` | Temp dir, emptied on startup |
+| `YTDLP_PATH` | `yt-dlp` | Binary |
+| `YTDLP_COOKIES_FILE` | empty | Netscape cookies; a per-job copy is passed (yt-dlp writes cookies back on exit) |
+| `YTDLP_AUTO_UPDATE` | `false` | `yt-dlp -U` on startup |
+| `REPLY_WITH_ERRORS` | `true` | Short reply when something can't be fetched |
+| `VPN_ENABLED` / `VPN_SS_URL` | `false` / empty | Phase 7; enabling without a URL is a config error; currently only warns "not supported yet" |
+| `LOG_LEVEL` | `INFO` | Logback root level |
 
-Steps:
-1. Implement `BotConfig.fromEnv()` — fail fast with a clear message if `BOT_TOKEN` is missing or numbers don't parse.
-2. `ShortsBot implements LongPollingSingleThreadUpdateConsumer`; in `consume(Update)` log chat id, chat type, sender, text.
-3. `Main`: build `OkHttpTelegramClient` + `TelegramBotsLongPollingApplication`, register bot, add a shutdown hook that closes everything.
-4. Ignore updates from chats not in `ALLOWED_CHAT_IDS` (log their id at INFO once so you can copy it into `.env`).
+### Link detection (phase 3)
+- Candidates come from `url` / `text_link` entities in text **and** captions, plus a regex scan of the raw text
+  (the scan only matches after whitespace/opening bracket, so links embedded in other URLs are ignored).
+- Supported: `youtube.com/shorts/{id}`, `youtu.be/{id}`; Instagram `/reel/`, `/reels/`, `/p/`, `/{user}/reel/`;
+  TikTok `/@user/video/{id}`, `vm.`/`vt.tiktok.com/{code}`, `tiktok.com/t/{code}`, `m.tiktok.com/v/{id}.html`.
+- Ignored: `youtube.com/watch`, channels/profiles, stories, TikTok `/photo/`, look-alike domains.
+- Tracking params dropped; `canonicalId` (`youtube:ID`, `instagram:ID`, `tiktok:ID`, `tiktok-short:CODE`) is the cache key.
 
-**Checkpoint:** run locally with `BOT_TOKEN=... java -jar ...`, write in the group → message + chat id appear in logs.
+### Downloading (phases 4, 5b)
+Command (args list, never a shell string):
+```
+yt-dlp --no-progress --no-warnings --no-colors --restrict-filenames --socket-timeout 20
+  --match-filter "duration <=? MAX_DURATION_SEC"      (<=? lets unknown durations through, e.g. Instagram)
+  --max-filesize MAX_FILE_MB M
+  -S "vcodec:h264,res:720,ext:mp4:m4a"                (H.264 plays inline everywhere; TikTok defaults to H.265)
+  --merge-output-format mp4 --remux-video mp4
+  --write-info-json --no-write-playlist-metafiles
+  -o "<workdir>/item-%(playlist_index|0)s.%(ext)s"
+  Instagram /p/ posts: --playlist-items 1:10 --ignore-no-formats-error --write-thumbnail --convert-thumbnails jpg
+  everything else:     --no-playlist --playlist-items 1
+  [--cookies <per-job copy>]  [--proxy socks5://127.0.0.1:1080 (phase 7)]
+  -- <url>
+```
+Gotchas learned from real runs:
+- yt-dlp exits **0 with no file** when `--match-filter` / `--max-filesize` rejects a video (stdout: `does not pass filter`
+  / `larger than max-filesize`), possibly leaving a partial `item-0.fNNN.mp4`.
+- For Instagram photo posts it exits **1** ("No video formats found") although the images were saved.
+- So success is decided **by the files**, not the exit code: `item-N.mp4` → video; else `item-N.jpg` with empty
+  `formats` in `item-N.info.json` → photo (the full-size image is the item's "thumbnail"); else skipped.
+  Nothing sendable → classify by stderr (exit ≠ 0) or stdout (exit 0).
+- Instagram gives no width/height/duration without login → `ffprobe` fallback.
+- Oversize items (photo > 10 MB, video > `MAX_FILE_MB`) are dropped; the rest of a post is still sent.
+- gallery-dl was rejected (needs Instagram login); the Instagram embed page carries no data without running JS.
 
----
-
-## 3. Link detection
-
-**Goal:** turn arbitrary message text into a list of supported video links.
-
-`LinkExtractor.extract(Message)`:
-1. Collect candidate URLs from **message entities** (`url` and `text_link` types) — more reliable than regex on raw text — plus `caption` entities (links forwarded with media). Fallback to a regex over text if there are no entities.
-2. Match each candidate against per-platform patterns (case-insensitive, optional `www.`/`m.`, ignore query string):
-   - YouTube Shorts: `youtube.com/shorts/{id}`, `youtu.be/{id}` *(accepted, but duration limit protects us from full-length videos)*
-   - Instagram: `instagram.com/reel/{id}`, `/reels/{id}`, `/p/{id}` (posts that are videos — yt-dlp will error on photos; handle gracefully)
-   - TikTok: `tiktok.com/@user/video/{id}`, `vm.tiktok.com/{code}`, `vt.tiktok.com/{code}`, `tiktok.com/t/{code}`
-3. Return `DetectedLink(platform, normalizedUrl, canonicalId)`; `canonicalId` = `platform:id` used for caching/dedup. De-duplicate within one message; cap at e.g. 5 links per message.
-
-Unit tests (table-driven): every URL shape above, with/without `www`, tracking params (`?igsh=…`, `?si=…`), trailing slashes, multiple links in one message, unrelated links (regular `youtube.com/watch`, other sites) → ignored.
-
-**Checkpoint:** `./gradlew test` green; bot logs "detected TIKTOK link …" for real messages.
-
----
-
-## 4. Downloading with yt-dlp
-
-**Goal:** `VideoDownloader.download(DetectedLink) → DownloadResult` producing a Telegram-friendly mp4.
-
-`YtDlpDownloader`:
-1. Create a unique temp dir per job under `DOWNLOAD_DIR`.
-2. Build the command (list of args, never a shell string — no injection risk):
-   ```
-   yt-dlp
-     --no-playlist --no-progress --no-warnings
-     --restrict-filenames
-     --playlist-items 1 --socket-timeout 20
-     --match-filter "duration <=? ${MAX_DURATION_SEC}"   (<=? lets unknown durations through)
-     --max-filesize ${MAX_FILE_MB}M
-     -S "vcodec:h264,res:720,ext:mp4:m4a"
-     --merge-output-format mp4
-     --remux-video mp4
-     -o "<tmpdir>/video.%(ext)s"
-     --write-info-json       (metadata → video.info.json: width/height/duration/title)
-     [--cookies <copy>]      (per-job copy of the configured file; yt-dlp writes cookies back on exit)
-     [--proxy socks5://127.0.0.1:1080]   (phase 6, if VPN enabled)
-     -- <url>
-   ```
-   `h264` + mp4 matters: Telegram inline-plays it on every client (TikTok/Instagram sometimes serve HEVC, which shows as a black box on some phones).
-3. Run with `ProcessBuilder`, read stdout/stderr on separate threads (avoid pipe-buffer deadlock), `waitFor(timeout)`; on timeout `destroyForcibly()`.
-4. yt-dlp exits **0 without a file** when `--match-filter` or `--max-filesize` rejects a video (stdout says `does not pass filter` / `larger than max-filesize`, a partial `video.fNNN.mp4` may remain) → only `video.mp4` counts as success.
-5. Map outcomes to `DownloadException` with a reason enum: `TOO_LONG`, `TOO_LARGE`, `NOT_A_VIDEO`, `LOGIN_REQUIRED`, `UNAVAILABLE`, `TIMEOUT`, `UNKNOWN` (by exit code + stderr patterns). Log full stderr at DEBUG.
-6. Parse JSON metadata with Jackson; verify size ≤ `MAX_FILE_MB`. If width/height/duration are missing (Instagram without login), read them with `ffprobe`.
-7. Caller is responsible for deleting the temp dir (try/finally) — plus a startup sweep that clears leftovers.
-
-Tests: unit-test command building; an integration test using a **fake `yt-dlp` shell script** (configured via `YTDLP_PATH`) that writes a dummy file + JSON, and one that sleeps (timeout path) / exits 1 with known stderr (error mapping).
-
-**Checkpoint:** `DownloadCli` downloads one real link of each platform to `downloads/`:
-`docker run --rm -v "$PWD":/w -w /w <image with java+ffmpeg+yt-dlp> java -cp build/libs/tg-shorts-bot.jar dev.shortsbot.DownloadCli <url>...`
+### Sending (phases 5, 5b)
+- Each link → job on a fixed pool of `WORKER_THREADS`; chat action `upload_video` (`upload_photo` for posts) every 4 s.
+- Cache hit (`SentPost` by `canonicalId`) → resend by file_id instantly; if Telegram rejects the file_id → evict and download.
+- 1 item → `sendVideo` / `sendPhoto`; 2–10 → `sendMediaGroup`. Replies silently (`disable_notification`), with
+  `allow_sending_without_reply`, in the same forum topic.
+- Text: only for Instagram `/p/` posts (reels/shorts/TikToks are sent without caption). ≤ 1024 chars → caption;
+  longer → media without caption + the text as a separate reply (truncated at 4096 without splitting emoji).
+- Retries: one retry for `TIMEOUT`/`UNKNOWN` (3 s delay); Telegram 429 → wait `retry_after` (max 60 s, 3 attempts).
+- Upload timeouts are **not** reported to the chat: Telegram may still deliver the media (this happened with the
+  OkHttp 10 s default timeout, hence `TelegramHttp` with 120 s).
+- `/start`, `/help` (also `/help@jaccob_bot`) explain the bot; edited messages and messages from bots are ignored.
+- Shutdown: stop polling, let jobs finish for 30 s, then interrupt (kills yt-dlp + ffmpeg).
 
 ---
 
-## 5. Sending to the chat + robustness
+## 6. Docker + one-command start (next)
 
-**Goal:** the full user-facing flow.
-
-Flow per detected link (submitted to a fixed thread pool of `WORKER_THREADS`, so the polling thread is never blocked):
-1. Send chat action `upload_video` (refresh every ~4s while working).
-2. **Cache check:** `FileIdCache` (in-memory LRU, e.g. 500 entries, `canonicalId → Telegram file_id`). If hit → `sendVideo` with the `file_id` instantly, no download.
-3. Otherwise download → `sendVideo`:
-   - `InputFile` from the mp4, `reply_to_message_id` = original message (with `allow_sending_without_reply=true`),
-   - `width`, `height`, `duration` from metadata, `supports_streaming=true`,
-   - caption: short, e.g. platform icon + link (optional, keep it minimal; make it configurable later if wanted),
-   - `disable_notification=true` (friends already saw the link).
-4. Store returned `file_id` in the cache. Delete temp dir.
-5. On failure: if `REPLY_WITH_ERRORS`, reply with a short human message per reason ("too long (> 3 min)", "Instagram wants a login — cookies needed", …). Never spam: one reply per message, not per retry.
-6. Retry policy: one retry for `UNKNOWN`/network-ish errors with a small backoff; no retry for `TOO_LONG`/`TOO_LARGE`/`NOT_A_VIDEO`.
-7. Handle Telegram `429 Too Many Requests` by honoring `retry_after`.
-8. Graceful shutdown: stop polling, let in-flight jobs finish (bounded wait), kill child processes.
-
-Nice-to-haves for this phase (small, worth doing):
-- `/start` and `/help` commands explaining what the bot does.
-- Ignore messages sent by bots (including itself).
-- Ignore edited messages (avoid re-posting).
-
-**Checkpoint:** in the real group, posting each of the three link types results in a playable video reply; posting the same link again replies instantly (cache); a long YouTube video gets a polite refusal.
-
----
-
-## 6. Docker + one-command start
-
-**Goal:** `docker compose up -d` is the only thing needed.
+**Goal:** `docker compose up -d` is the only thing needed on a machine with Docker.
 
 `Dockerfile` (multi-stage):
-1. **build stage** `eclipse-temurin:25-jdk` → copy `gradlew`, `gradle/`, `settings.gradle.kts`, `build.gradle.kts` first and run `./gradlew dependencies --no-daemon` (layer cache), then sources, `./gradlew shadowJar --no-daemon -x test` (tests run in CI / locally). Use a BuildKit cache mount for `/root/.gradle` to speed up rebuilds.
-2. **runtime stage** `eclipse-temurin:25-jre` (Debian-based, so apt works):
-   - `apt-get install ffmpeg python3 ca-certificates curl` (+ `xz-utils` for phase 7),
-   - install yt-dlp as the official standalone binary from GitHub releases (`yt-dlp_linux` / `yt-dlp_linux_aarch64` chosen by `TARGETARCH`) → `/usr/local/bin/yt-dlp`,
-   - non-root user, `WORKDIR /app`, copy jar,
-   - `ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "/app/tg-shorts-bot.jar"]`.
+1. **build stage** `eclipse-temurin:25-jdk`: copy `gradlew`, `gradle/`, `settings.gradle.kts`, `build.gradle.kts`
+   first and resolve dependencies (layer cache), then sources, `./gradlew shadowJar --no-daemon -x test`.
+   BuildKit cache mount for `/root/.gradle`.
+2. **runtime stage** `eclipse-temurin:25-jre`, the same as the dev image above (ffmpeg, ca-certificates, yt-dlp standalone
+   binary by `TARGETARCH`), plus: non-root user that owns the yt-dlp binary (so `YTDLP_AUTO_UPDATE` works),
+   `WORKDIR /app`, copy jar, `ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "/app/tg-shorts-bot.jar"]`.
 
 `docker-compose.yml`:
 ```yaml
@@ -223,83 +185,56 @@ services:
     restart: unless-stopped
     env_file: .env
     volumes:
-      - ./cookies.txt:/app/cookies.txt:ro    # optional; documented in README
+      - ./secrets:/app/secrets:ro     # optional cookies.txt → YTDLP_COOKIES_FILE=/app/secrets/cookies.txt
     tmpfs:
       - /tmp/shortsbot:size=512m
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
 ```
-(The cookies mount will be made optional — e.g. mount a `./secrets/` dir instead of a single file, so a missing file doesn't break startup.)
+Mount a directory, not a single file, so a missing cookies file doesn't break startup (the bot already just warns).
 
-`.env.example` with every variable from phase 2, comments, and `VPN_ENABLED=false`.
+`README.md`: what the bot does, BotFather steps (privacy mode!), `cp .env.example .env`, `docker compose up -d`,
+`docker compose logs -f`, getting the chat id from the logs, exporting Instagram cookies, updating yt-dlp
+(`docker compose build --pull --no-cache && docker compose up -d`), `DownloadCli` for debugging.
 
-`README.md`: BotFather steps (incl. privacy mode!), `cp .env.example .env`, `docker compose up -d`, `docker compose logs -f`, how to export Instagram cookies, how to update yt-dlp (`docker compose build --pull --no-cache && docker compose up -d`).
-
-**Checkpoint:** on a clean machine with only Docker: clone → fill `.env` → `docker compose up -d` → bot works in the group.
+**Checkpoint:** with only Docker: clone → fill `.env` → `docker compose up -d` → bot works in the group.
 
 ---
 
-## 7. VPN via Outline (`ss://`) — optional, default off
+## 7. VPN via Outline (`ss://`), optional, default off
 
-**Goal:** with `VPN_ENABLED=true`, *all* outbound traffic of the bot (Telegram API **and** yt-dlp) goes through the Outline server. Both matter: countries that block Instagram/TikTok/YouTube often block Telegram too.
+**Goal:** with `VPN_ENABLED=true`, *all* outbound traffic (Telegram API **and** yt-dlp) goes through the Outline server.
+Countries that block Instagram/TikTok/YouTube often block Telegram too.
 
-### 7.1 Parse the Outline key — `ShadowsocksUrl`
-Outline keys come in these shapes; support all:
-- SIP002: `ss://BASE64URL(method:password)@host:port/?outline=1#Name`
-- Legacy: `ss://BASE64(method:password@host:port)#Name`
-- Dynamic key: `ssconf://host/path…` → fetch over HTTPS (`ssconf` → `https`), response is either an `ss://` string or JSON `{server, server_port, password, method}`.
+1. **`proxy/ShadowsocksUrl`** parses: SIP002 `ss://BASE64URL(method:password)@host:port/?outline=1#Name`;
+   legacy `ss://BASE64(method:password@host:port)#Name`; dynamic `ssconf://…` (fetch via `https://`, response is an
+   `ss://` string or JSON `{server, server_port, password, method}`). Record `(method, password, host, port)`; never log
+   the password. Unit tests: padded/unpadded, URL-safe base64, percent-encoding, IPv6 host.
+2. **Image:** download the `shadowsocks-rust` release for `TARGETARCH`, put `sslocal` in `/usr/local/bin` (needs `xz-utils`).
+3. **`proxy/ShadowsocksSidecar`** (started before Telegram/yt-dlp are touched): run `sslocal` with a `0600` temp JSON
+   config (password not visible in `ps`), bind `127.0.0.1:1080`, pipe output to the logger as `[sslocal]`, wait for the
+   port, probe `https://api.telegram.org` through the proxy, restart with backoff if it dies, kill it on shutdown.
+4. **Routing**, one `ProxySettings` (`Optional<InetSocketAddress>`) built in `Main`:
+   - Telegram: `TelegramHttp.newClient()` gets `.proxy(new Proxy(SOCKS, …))`; the long-polling application gets the same
+     via its `Supplier<OkHttpClient>` constructor (it has its own client with 100 s read timeout). OkHttp resolves DNS
+     through SOCKS.
+   - yt-dlp: `--proxy socks5://127.0.0.1:1080` (covers videos, Instagram photos, everything).
+   - `VPN_ENABLED=false` → behavior identical to before. Remove the "not supported yet" warning in `Main`.
+5. Compose unchanged; only `.env` gets `VPN_ENABLED=true` and `VPN_SS_URL=ss://…`.
 
-Produce a record `(method, password, host, port)`; never log the password. Unit-test with sample keys (padded/unpadded base64, URL-safe alphabet, percent-encoded parts, IPv6 host).
-
-### 7.2 Bundle `sslocal`
-In the Dockerfile download the `shadowsocks-rust` release tarball for the target arch, extract `sslocal` to `/usr/local/bin`. (Small static binary, a few MB.)
-
-### 7.3 Start it from Java — `ShadowsocksSidecar`
-On startup, before Telegram/yt-dlp are touched, if `VPN_ENABLED`:
-1. Validate `VPN_SS_URL` is present (fail fast otherwise).
-2. Start `sslocal -b 127.0.0.1:1080 -s host:port -m method -k password` (args list; or write a temp JSON config with `0600` perms so the password doesn't show in `ps`).
-3. Pipe its output into our logger with a `[sslocal]` prefix.
-4. Wait until the SOCKS port accepts connections (poll up to ~10s), then do a **connectivity probe** through the proxy (e.g. HTTPS GET `https://api.telegram.org` via a `java.net.Proxy(SOCKS)`), log success/failure clearly.
-5. Supervise: if the process dies, log + restart with backoff; destroy it in the shutdown hook.
-
-### 7.4 Route traffic through it
-- **Telegram:** build a custom `OkHttpClient` with `.proxy(new Proxy(Proxy.Type.SOCKS, 127.0.0.1:1080))` and pass it to `OkHttpTelegramClient` and the long-polling application. OkHttp resolves hostnames via the SOCKS server, so DNS isn't leaked/blocked either.
-- **yt-dlp:** add `--proxy socks5://127.0.0.1:1080` to every command.
-- Keep everything behind one `ProxySettings` object (`Optional<InetSocketAddress>`) built in `Main` and handed to both components → when `VPN_ENABLED=false` nothing changes from phases 1–6.
-
-### 7.5 Docker/compose
-Nothing new in compose besides two variables in `.env`:
-```
-VPN_ENABLED=true
-VPN_SS_URL=ss://...
-```
-Still a single `docker compose up -d`.
-
-**Checkpoint:** with `VPN_ENABLED=true`, logs show sslocal started + probe OK; videos still arrive; verify egress IP by temporarily logging the result of `yt-dlp --proxy … --print … ` or `curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me` inside the container equals the Outline server's IP. With `VPN_ENABLED=false` behavior is identical to before.
+**Checkpoint:** logs show sslocal started + probe OK; media still arrives; egress IP inside the container
+(`curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me`) equals the Outline server's IP.
 
 ---
 
 ## 8. Hardening & polish (after it all works)
 
-- **Health:** Docker `HEALTHCHECK` touching a heartbeat file the poller updates every loop.
-- **yt-dlp freshness:** `YTDLP_AUTO_UPDATE=true` runs `yt-dlp -U` at startup (binary is writable by the app user), plus a README note to rebuild weekly.
-- **Abuse limits:** per-chat rate limit (e.g. 10 links/minute), max queue size — drop with a log when full.
-- **Too-large fallback:** if > 49 MB, retry once with `-S "res:480"`; still too big → polite refusal.
-- **Optional features** (only if you want them): delete the original message after posting (needs admin rights; config flag), caption with the original poster's name, support for Instagram carousels / TikTok photo posts via `sendMediaGroup`, persistent file_id cache (simple JSON file on a volume).
+- **Health:** Docker `HEALTHCHECK` on a heartbeat file the poller updates.
+- **yt-dlp freshness:** `YTDLP_AUTO_UPDATE=true` and/or a README note to rebuild regularly.
+- **Abuse limits:** per-chat rate limit (e.g. 10 links/min), bounded job queue (drop with a log when full);
+  dedupe the same link while it's still in flight.
+- **Too-large fallback:** if a video is > `MAX_FILE_MB`, retry once with `-S "res:480"`.
+- **Optional features** (only if wanted): TikTok photo posts (`/photo/`), delete the original message after posting
+  (needs admin + config flag), caption with the poster's name, persistent cache on a volume, configurable reply language.
 - **CI:** GitHub Actions running `./gradlew build` and `docker build`.
-
----
-
-## Order of execution (summary)
-
-1. Skeleton + Gradle wrapper → builds.
-2. Config + bot receives group messages.
-3. Link extractor + tests.
-4. yt-dlp downloader + tests.
-5. Send video, cache, errors, concurrency → **usable bot**.
-6. Dockerfile + compose + README → **one-command deploy**.
-7. Outline/Shadowsocks VPN toggle.
-8. Hardening.
-
-Each step is a separate commit; tests stay green at every step.
