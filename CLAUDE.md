@@ -39,7 +39,7 @@ Tests must stay green. Push to GitHub only when the user asks.
 - `.env` holds the real `BOT_TOKEN` and `ALLOWED_CHAT_IDS` (test group `-5230348538`, a basic group; if Telegram
   converts it to a supergroup the id changes to `-100…` and the bot logs "Ignoring messages from chat …").
   `.env`, `cookies.txt`, `secrets/` are git-ignored and must never be committed.
-- Bot: `@jaccob_bot`. Privacy mode is already disabled in @BotFather.
+- Bot: `@shortsinchatbot` (replaced the earlier test bot `@jaccob_bot`). Privacy mode is disabled in @BotFather.
 
 ---
 
@@ -160,7 +160,7 @@ Gotchas learned from real runs:
 - Retries: one retry for `TIMEOUT`/`UNKNOWN` (3 s delay); Telegram 429 → wait `retry_after` (max 60 s, 3 attempts).
 - Upload timeouts are **not** reported to the chat: Telegram may still deliver the media (this happened with the
   OkHttp 10 s default timeout, hence `TelegramHttp` with 120 s).
-- `/start`, `/help` (also `/help@jaccob_bot`) explain the bot; edited messages and messages from bots are ignored.
+- `/start`, `/help` (also `/help@shortsinchatbot`) explain the bot; edited messages and messages from bots are ignored.
 - Shutdown: stop polling, let jobs finish for 30 s, then interrupt (kills yt-dlp + ffmpeg).
 
 ---
