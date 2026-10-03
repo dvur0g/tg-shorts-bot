@@ -1,0 +1,8 @@
+.env
+cookies.txt
+secrets/
+target/
+downloads/
+.idea/
+*.iml
+.DS_Store
