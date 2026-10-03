@@ -55,6 +55,7 @@ tg-shorts-bot/
 └── src/
     ├── main/java/dev/shortsbot/
     │   ├── Main.java
+    │   ├── DownloadCli.java                   (debug tool: download links with the bot's settings)
     │   ├── config/BotConfig.java
     │   ├── telegram/ShortsBot.java            (update consumer)
     │   ├── telegram/VideoSender.java
@@ -145,26 +146,29 @@ Unit tests (table-driven): every URL shape above, with/without `www`, tracking p
    yt-dlp
      --no-playlist --no-progress --no-warnings
      --restrict-filenames
-     --match-filter "duration <= ${MAX_DURATION_SEC}"
+     --playlist-items 1 --socket-timeout 20
+     --match-filter "duration <=? ${MAX_DURATION_SEC}"   (<=? lets unknown durations through)
      --max-filesize ${MAX_FILE_MB}M
      -S "vcodec:h264,res:720,ext:mp4:m4a"
      --merge-output-format mp4
      --remux-video mp4
      -o "<tmpdir>/video.%(ext)s"
-     --print-json            (metadata on stdout → width/height/duration/title)
-     [--cookies <file>]      (if configured)
+     --write-info-json       (metadata → video.info.json: width/height/duration/title)
+     [--cookies <copy>]      (per-job copy of the configured file; yt-dlp writes cookies back on exit)
      [--proxy socks5://127.0.0.1:1080]   (phase 6, if VPN enabled)
-     <url>
+     -- <url>
    ```
    `h264` + mp4 matters: Telegram inline-plays it on every client (TikTok/Instagram sometimes serve HEVC, which shows as a black box on some phones).
 3. Run with `ProcessBuilder`, read stdout/stderr on separate threads (avoid pipe-buffer deadlock), `waitFor(timeout)`; on timeout `destroyForcibly()`.
-4. Map outcomes to `DownloadException` with a reason enum: `TOO_LONG`, `TOO_LARGE`, `NOT_A_VIDEO`, `LOGIN_REQUIRED`, `UNAVAILABLE`, `TIMEOUT`, `UNKNOWN` (by exit code + stderr patterns). Log full stderr at DEBUG.
-5. Parse JSON metadata with Jackson; locate the resulting `video.mp4`; verify size ≤ `MAX_FILE_MB`.
-6. Caller is responsible for deleting the temp dir (try/finally) — plus a startup sweep that clears leftovers.
+4. yt-dlp exits **0 without a file** when `--match-filter` or `--max-filesize` rejects a video (stdout says `does not pass filter` / `larger than max-filesize`, a partial `video.fNNN.mp4` may remain) → only `video.mp4` counts as success.
+5. Map outcomes to `DownloadException` with a reason enum: `TOO_LONG`, `TOO_LARGE`, `NOT_A_VIDEO`, `LOGIN_REQUIRED`, `UNAVAILABLE`, `TIMEOUT`, `UNKNOWN` (by exit code + stderr patterns). Log full stderr at DEBUG.
+6. Parse JSON metadata with Jackson; verify size ≤ `MAX_FILE_MB`. If width/height/duration are missing (Instagram without login), read them with `ffprobe`.
+7. Caller is responsible for deleting the temp dir (try/finally) — plus a startup sweep that clears leftovers.
 
 Tests: unit-test command building; an integration test using a **fake `yt-dlp` shell script** (configured via `YTDLP_PATH`) that writes a dummy file + JSON, and one that sleeps (timeout path) / exits 1 with known stderr (error mapping).
 
-**Checkpoint:** a tiny dev entrypoint (or test marked `@Tag("manual")`) downloads one real link of each platform to disk.
+**Checkpoint:** `DownloadCli` downloads one real link of each platform to `downloads/`:
+`docker run --rm -v "$PWD":/w -w /w <image with java+ffmpeg+yt-dlp> java -cp build/libs/tg-shorts-bot.jar dev.shortsbot.DownloadCli <url>...`
 
 ---
 
