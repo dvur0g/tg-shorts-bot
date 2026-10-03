@@ -17,6 +17,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -38,6 +41,8 @@ public class LinkProcessor {
     private final LruCache<SentPost> cache;
     private final ScheduledExecutorService scheduler;
     private final Duration retryDelay;
+    /** Links currently being fetched, by canonicalId; completed when the owning job is done. */
+    private final ConcurrentHashMap<String, CompletableFuture<Void>> inFlight = new ConcurrentHashMap<>();
 
     public LinkProcessor(BotConfig config, VideoDownloader downloader, ChatGateway chat, LruCache<SentPost> cache,
                          ScheduledExecutorService scheduler, Duration retryDelay) {
@@ -51,13 +56,35 @@ public class LinkProcessor {
 
     public void process(ReplyTarget target, DetectedLink link) {
         try {
-            if (sendCached(target, link)) {
-                return;
+            while (true) {
+                var mine = new CompletableFuture<Void>();
+                CompletableFuture<Void> running = inFlight.putIfAbsent(link.canonicalId(), mine);
+                if (running == null) {
+                    try {
+                        if (!sendCached(target, link)) {
+                            downloadAndSend(target, link);
+                        }
+                    } finally {
+                        inFlight.remove(link.canonicalId(), mine);
+                        mine.complete(null);
+                    }
+                    return;
+                }
+                // The same video is being fetched for an earlier message; wait and then answer from the cache.
+                log.info("{} is already being fetched, waiting for it", link.canonicalId());
+                awaitQuietly(running);
             }
-            downloadAndSend(target, link);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             log.info("Stopped processing {} because the bot is shutting down", link.canonicalId());
+        }
+    }
+
+    private static void awaitQuietly(CompletableFuture<Void> future) throws InterruptedException {
+        try {
+            future.get();
+        } catch (ExecutionException e) {
+            // Never completed exceptionally; the owner's outcome is read from the cache instead.
         }
     }
 

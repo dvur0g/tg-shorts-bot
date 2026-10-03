@@ -32,6 +32,8 @@ class BotConfigTest {
         assertThat(config.maxFileMb()).isEqualTo(49);
         assertThat(config.downloadTimeout()).isEqualTo(Duration.ofSeconds(120));
         assertThat(config.workerThreads()).isEqualTo(2);
+        assertThat(config.maxQueuedLinks()).isEqualTo(20);
+        assertThat(config.rateLimitPerMinute()).isEqualTo(10);
         assertThat(config.downloadDir()).isEqualTo(Path.of("/tmp/shortsbot"));
         assertThat(config.ytDlpPath()).isEqualTo("yt-dlp");
         assertThat(config.ytDlpCookiesFile()).isEmpty();
@@ -49,6 +51,8 @@ class BotConfigTest {
                 "MAX_FILE_MB", "20",
                 "DOWNLOAD_TIMEOUT_SEC", "30",
                 "WORKER_THREADS", "4",
+                "MAX_QUEUED_LINKS", "5",
+                "RATE_LIMIT_PER_MINUTE", "0",
                 "DOWNLOAD_DIR", "/data/dl",
                 "YTDLP_PATH", "/usr/local/bin/yt-dlp",
                 "YTDLP_COOKIES_FILE", "/app/secrets/cookies.txt",
@@ -62,6 +66,8 @@ class BotConfigTest {
         assertThat(config.maxFileMb()).isEqualTo(20);
         assertThat(config.downloadTimeout()).isEqualTo(Duration.ofSeconds(30));
         assertThat(config.workerThreads()).isEqualTo(4);
+        assertThat(config.maxQueuedLinks()).isEqualTo(5);
+        assertThat(config.rateLimitPerMinute()).isZero();
         assertThat(config.downloadDir()).isEqualTo(Path.of("/data/dl"));
         assertThat(config.ytDlpPath()).isEqualTo("/usr/local/bin/yt-dlp");
         assertThat(config.ytDlpCookiesFile()).contains(Path.of("/app/secrets/cookies.txt"));

@@ -41,11 +41,9 @@ public class YtDlpDownloader implements VideoDownloader {
     private static final String FFPROBE = "ffprobe";
     private static final Duration UTILITY_TIMEOUT = Duration.ofSeconds(90);
 
-    /**
-     * Prefer H.264 (plays inline in every Telegram client; TikTok often serves H.265 by default),
-     * at most 720p, in an mp4/m4a container so merging needs no re-encoding.
-     */
-    private static final String FORMAT_SORT = "vcodec:h264,res:720,ext:mp4:m4a";
+    static final int PREFERRED_HEIGHT = 720;
+    /** Used for a second attempt when the 720p version is over the size limit. */
+    static final int FALLBACK_HEIGHT = 480;
 
     private final BotConfig config;
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -78,6 +76,18 @@ public class YtDlpDownloader implements VideoDownloader {
 
     @Override
     public DownloadResult download(DetectedLink link) throws DownloadException, InterruptedException {
+        try {
+            return download(link, PREFERRED_HEIGHT);
+        } catch (DownloadException e) {
+            if (e.reason() != Reason.TOO_LARGE) {
+                throw e;
+            }
+            log.info("{} is too large at {}p, trying {}p", link.url(), PREFERRED_HEIGHT, FALLBACK_HEIGHT);
+            return download(link, FALLBACK_HEIGHT);
+        }
+    }
+
+    private DownloadResult download(DetectedLink link, int maxHeight) throws DownloadException, InterruptedException {
         Path workDir;
         try {
             Files.createDirectories(config.downloadDir());
@@ -88,7 +98,7 @@ public class YtDlpDownloader implements VideoDownloader {
 
         boolean success = false;
         try {
-            DownloadResult result = runDownload(link, workDir);
+            DownloadResult result = runDownload(link, workDir, maxHeight);
             success = true;
             return result;
         } finally {
@@ -98,8 +108,9 @@ public class YtDlpDownloader implements VideoDownloader {
         }
     }
 
-    private DownloadResult runDownload(DetectedLink link, Path workDir) throws DownloadException, InterruptedException {
-        List<String> command = buildCommand(link, workDir, copyCookies(workDir));
+    private DownloadResult runDownload(DetectedLink link, Path workDir, int maxHeight)
+            throws DownloadException, InterruptedException {
+        List<String> command = buildCommand(link, workDir, copyCookies(workDir), maxHeight);
         log.debug("Running {}", command);
 
         long started = System.nanoTime();
@@ -200,6 +211,10 @@ public class YtDlpDownloader implements VideoDownloader {
     }
 
     List<String> buildCommand(DetectedLink link, Path workDir, Optional<Path> cookiesFile) {
+        return buildCommand(link, workDir, cookiesFile, PREFERRED_HEIGHT);
+    }
+
+    List<String> buildCommand(DetectedLink link, Path workDir, Optional<Path> cookiesFile, int maxHeight) {
         var command = new ArrayList<>(List.of(
                 config.ytDlpPath(),
                 "--no-progress",
@@ -210,7 +225,9 @@ public class YtDlpDownloader implements VideoDownloader {
                 // "<=?" lets videos without a known duration through instead of rejecting them
                 "--match-filter", "duration <=? " + config.maxDurationSec(),
                 "--max-filesize", config.maxFileMb() + "M",
-                "-S", FORMAT_SORT,
+                // Prefer H.264 (plays inline in every Telegram client; TikTok often serves H.265 by default),
+                // at most maxHeight, in an mp4/m4a container so merging needs no re-encoding.
+                "-S", "vcodec:h264,res:" + maxHeight + ",ext:mp4:m4a",
                 "--merge-output-format", "mp4",
                 "--remux-video", "mp4",
                 "--write-info-json",

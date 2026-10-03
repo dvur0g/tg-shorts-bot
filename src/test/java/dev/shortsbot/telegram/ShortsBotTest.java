@@ -14,6 +14,7 @@ import org.telegram.telegrambots.meta.api.objects.User;
 import org.telegram.telegrambots.meta.api.objects.chat.Chat;
 import org.telegram.telegrambots.meta.api.objects.message.Message;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -74,6 +75,15 @@ class ShortsBotTest {
     }
 
     @Test
+    void dropsLinksOverTheRateLimit() throws Exception {
+        bot.consume(update(message(GROUP_ID, false,
+                "https://youtu.be/aaaaaaaaaaa https://youtu.be/bbbbbbbbbbb https://youtu.be/ccccccccccc")));
+        bot.consume(update(message(GROUP_ID, false, "https://youtu.be/ddddddddddd")));
+
+        assertThat(drainWorkers()).hasSize(3).doesNotContain("https://youtu.be/ddddddddddd");
+    }
+
+    @Test
     void answersHelpCommands() {
         bot.consume(update(command("/help")));
         bot.consume(update(command("/start@shorts_test_bot")));
@@ -98,7 +108,8 @@ class ShortsBotTest {
             downloadedUrls.add(link.url());
             throw new DownloadException(Reason.UNAVAILABLE, "test");
         }, chat, new LruCache<>(10), scheduler, Duration.ZERO);
-        return new ShortsBot(config, "shorts_test_bot", new LinkExtractor(), processor, chat, workers);
+        return new ShortsBot(config, "shorts_test_bot", new LinkExtractor(), processor, chat, workers,
+                new RateLimiter(3, Duration.ofMinutes(1), Clock.systemUTC()));
     }
 
     private static Update update(Message message) {

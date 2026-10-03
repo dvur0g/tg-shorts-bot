@@ -1,11 +1,14 @@
 package dev.shortsbot;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.shortsbot.cache.LruCache;
 import dev.shortsbot.config.BotConfig;
 import dev.shortsbot.config.ConfigException;
 import dev.shortsbot.download.YtDlpDownloader;
+import dev.shortsbot.health.HeartbeatBackOff;
 import dev.shortsbot.link.LinkExtractor;
 import dev.shortsbot.telegram.LinkProcessor;
+import dev.shortsbot.telegram.RateLimiter;
 import dev.shortsbot.telegram.SentPost;
 import dev.shortsbot.telegram.ShortsBot;
 import dev.shortsbot.telegram.TelegramChatGateway;
@@ -14,17 +17,22 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.telegram.telegrambots.client.okhttp.OkHttpTelegramClient;
 import org.telegram.telegrambots.longpolling.TelegramBotsLongPollingApplication;
+import org.telegram.telegrambots.longpolling.util.TelegramOkHttpClientFactory;
 import org.telegram.telegrambots.meta.api.methods.GetMe;
 import org.telegram.telegrambots.meta.api.objects.User;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 import org.telegram.telegrambots.meta.generics.TelegramClient;
 
 import java.io.IOException;
+import java.nio.file.Path;
+import java.time.Clock;
 import java.time.Duration;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 public final class Main {
@@ -33,6 +41,9 @@ public final class Main {
     private static final Duration DOWNLOAD_RETRY_DELAY = Duration.ofSeconds(3);
     private static final Duration SHUTDOWN_GRACE = Duration.ofSeconds(30);
     private static final int SENT_CACHE_SIZE = 500;
+    private static final Duration YTDLP_UPDATE_INTERVAL = Duration.ofHours(24);
+    /** Written after every successful poll; the Docker HEALTHCHECK checks its age. */
+    private static final Path HEARTBEAT_FILE = Path.of(System.getProperty("java.io.tmpdir"), "tg-shorts-bot.heartbeat");
 
     private Main() {
     }
@@ -69,13 +80,26 @@ public final class Main {
         var chat = new TelegramChatGateway(telegramClient);
         ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
                 Thread.ofPlatform().name("chat-action").daemon().factory());
-        ExecutorService workers = Executors.newFixedThreadPool(config.workerThreads(),
+        // Bounded queue: when friends (or a spammer) post more links than the bot can handle, extra ones are dropped.
+        ExecutorService workers = new ThreadPoolExecutor(config.workerThreads(), config.workerThreads(),
+                0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(config.maxQueuedLinks()),
                 Thread.ofPlatform().name("download-", 1).factory());
         var processor = new LinkProcessor(config, downloader, chat, new LruCache<SentPost>(SENT_CACHE_SIZE), scheduler,
                 DOWNLOAD_RETRY_DELAY);
-        var bot = new ShortsBot(config, me.getUserName(), new LinkExtractor(), processor, chat, workers);
+        var rateLimiter = new RateLimiter(config.rateLimitPerMinute(), Duration.ofMinutes(1), Clock.systemUTC());
+        var bot = new ShortsBot(config, me.getUserName(), new LinkExtractor(), processor, chat, workers, rateLimiter);
 
-        var application = new TelegramBotsLongPollingApplication();
+        ScheduledExecutorService maintenance = Executors.newSingleThreadScheduledExecutor(
+                Thread.ofPlatform().name("maintenance").daemon().factory());
+        if (config.ytDlpAutoUpdate()) {
+            maintenance.scheduleAtFixedRate(() -> selfUpdateQuietly(downloader),
+                    YTDLP_UPDATE_INTERVAL.toHours(), YTDLP_UPDATE_INTERVAL.toHours(), TimeUnit.HOURS);
+        }
+
+        var application = new TelegramBotsLongPollingApplication(ObjectMapper::new,
+                new TelegramOkHttpClientFactory.DefaultOkHttpClientCreator(),
+                Executors::newSingleThreadScheduledExecutor,
+                () -> new HeartbeatBackOff(HEARTBEAT_FILE));
         application.registerBot(config.botToken(), bot);
         log.info("Bot is running; waiting for links");
 
@@ -91,6 +115,7 @@ public final class Main {
                     workers.awaitTermination(10, TimeUnit.SECONDS);
                 }
                 scheduler.shutdownNow();
+                maintenance.shutdownNow();
             } catch (Exception e) {
                 log.warn("Error during shutdown", e);
             } finally {
@@ -109,6 +134,14 @@ public final class Main {
             log.info("Using yt-dlp {}", downloader.version());
         } catch (IOException e) {
             throw new IOException("yt-dlp is not usable (YTDLP_PATH=" + config.ytDlpPath() + "): " + e.getMessage(), e);
+        }
+    }
+
+    private static void selfUpdateQuietly(YtDlpDownloader downloader) {
+        try {
+            downloader.selfUpdate();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 

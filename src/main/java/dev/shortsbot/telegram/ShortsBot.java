@@ -35,16 +35,18 @@ public class ShortsBot extends DefaultLongPollingUpdateConsumer {
     private final LinkProcessor linkProcessor;
     private final ChatGateway chat;
     private final ExecutorService workers;
+    private final RateLimiter rateLimiter;
     private final Set<Long> reportedIgnoredChats = ConcurrentHashMap.newKeySet();
 
     public ShortsBot(BotConfig config, String botUsername, LinkExtractor linkExtractor, LinkProcessor linkProcessor,
-                     ChatGateway chat, ExecutorService workers) {
+                     ChatGateway chat, ExecutorService workers, RateLimiter rateLimiter) {
         this.config = config;
         this.botUsername = botUsername;
         this.linkExtractor = linkExtractor;
         this.linkProcessor = linkProcessor;
         this.chat = chat;
         this.workers = workers;
+        this.rateLimiter = rateLimiter;
     }
 
     @Override
@@ -91,11 +93,17 @@ public class ShortsBot extends DefaultLongPollingUpdateConsumer {
         }
         var target = ReplyTarget.of(message);
         for (DetectedLink link : links) {
+            if (!rateLimiter.tryAcquire(chatInfo.getId())) {
+                log.warn("Chat {}: rate limit of {} links/min reached, ignoring {}",
+                        chatInfo.getId(), config.rateLimitPerMinute(), link.url());
+                continue;
+            }
             log.info("Chat {}: {} link {} from {}", chatInfo.getId(), link.platform(), link.url(), describe(message.getFrom()));
             try {
                 workers.execute(() -> linkProcessor.process(target, link));
             } catch (RejectedExecutionException e) {
-                log.warn("Dropping {}: the bot is shutting down", link.canonicalId());
+                log.warn("Dropping {}: {}", link.canonicalId(),
+                        workers.isShutdown() ? "the bot is shutting down" : "too many links waiting (MAX_QUEUED_LINKS)");
             }
         }
     }

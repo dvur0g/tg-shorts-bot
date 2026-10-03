@@ -23,7 +23,10 @@ import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -191,6 +194,39 @@ class LinkProcessorTest {
 
         assertThat(video.workDir()).doesNotExist();
         assertThat(chat.replies).isEmpty();
+    }
+
+    @Test
+    void sameLinkPostedWhileDownloadingIsServedFromCacheAfterwards() throws Exception {
+        var started = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var calls = new AtomicInteger();
+        Path workDir = Files.createTempDirectory(tmp, "job-");
+        Path file = Files.writeString(workDir.resolve("item-0.mp4"), "x");
+        VideoDownloader slow = link -> {
+            calls.incrementAndGet();
+            started.countDown();
+            release.await();
+            return new DownloadResult(List.of(new MediaItem(MediaType.VIDEO, file, 1, 720, 1280, 10)), "", "", workDir);
+        };
+        var config = BotConfig.fromEnv(Map.of("BOT_TOKEN", "123:abc"));
+        var processor = new LinkProcessor(config, slow, chat, cache, scheduler, Duration.ZERO);
+        var workers = Executors.newFixedThreadPool(2);
+        try {
+            workers.execute(() -> processor.process(TARGET, REEL));
+            assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+            workers.execute(() -> processor.process(new ReplyTarget(-100L, null, 8), REEL));
+            Thread.sleep(200);
+            release.countDown();
+            workers.shutdown();
+            assertThat(workers.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            workers.shutdownNow();
+        }
+
+        assertThat(calls).hasValue(1);
+        assertThat(chat.sent).hasSize(2);
+        assertThat(chat.sent.get(1).media().getFirst().fileId()).isEqualTo("file-id-1");
     }
 
     @Test

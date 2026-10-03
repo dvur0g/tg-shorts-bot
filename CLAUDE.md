@@ -18,8 +18,8 @@ downloads the media and posts it back into the chat as a reply to the original m
 | 5 | Sending to the chat, cache, errors, concurrency | ✅ done, verified in the test group |
 | 5b | Instagram `/p/` posts: photos/albums + post text | ✅ done, verified in the test group |
 | 6 | Dockerfile + docker-compose + README | ✅ done, bot runs via compose |
-| 7 | Outline / Shadowsocks VPN toggle | ⏳ next |
-| 8 | Hardening & polish | planned |
+| 7 | Outline / Shadowsocks VPN toggle | ⏸ postponed by the user, plan below |
+| 8 | Hardening & polish | ✅ done (CI postponed, optional features left open) |
 
 Each phase is one commit (fixes found while testing a phase go into that phase's commit or a follow-up).
 Tests must stay green. Push to GitHub only when the user asks.
@@ -28,7 +28,7 @@ Tests must stay green. Push to GitHub only when the user asks.
 
 ## Working on this repo
 
-- Build + all tests: `./gradlew build` → `build/libs/tg-shorts-bot.jar` (shadow/fat jar). ~90 unit tests, no network.
+- Build + all tests: `./gradlew build` → `build/libs/tg-shorts-bot.jar` (shadow/fat jar). ~100 unit tests, no network.
 - The host has Java 25 but **no yt-dlp/ffmpeg** and no Gradle install (the wrapper downloads Gradle).
   Real downloads and bot runs happen in Docker:
   - Run / redeploy the bot: `docker compose up -d --build` (container `tg-shorts-bot`, service `bot`).
@@ -79,9 +79,11 @@ src/main/java/dev/shortsbot/
 ├── download/MediaType.java         VIDEO, PHOTO
 ├── download/DownloadException.java reason: TOO_LONG, TOO_LARGE, NOT_A_VIDEO, LOGIN_REQUIRED, UNAVAILABLE, TIMEOUT, UNKNOWN
 ├── cache/LruCache.java             generic thread-safe LRU (500 entries of SentPost)
+├── health/HeartbeatBackOff.java    wraps the polling back-off; writes /tmp/tg-shorts-bot.heartbeat on each successful poll
 └── telegram/
-    ├── ShortsBot.java              update consumer: allow-list, ignore bots/edits, /help, dispatch links to worker pool
-    ├── LinkProcessor.java          cache → download (1 retry) → send → cache; caption rules; error replies
+    ├── ShortsBot.java              update consumer: allow-list, ignore bots/edits, /help, rate limit, dispatch to workers
+    ├── LinkProcessor.java          in-flight dedupe → cache → download (1 retry) → send → cache; caption rules; errors
+    ├── RateLimiter.java            sliding window of links per chat per minute
     ├── ChatGateway.java            interface over Telegram calls (faked in tests)
     ├── TelegramChatGateway.java    sendVideo / sendPhoto / sendMediaGroup / reply / chat action; honors 429 retry_after
     ├── TelegramHttp.java           OkHttp client for API calls (30 s connect, 120 s read/write)
@@ -101,10 +103,12 @@ src/main/java/dev/shortsbot/
 | `MAX_FILE_MB` | `49` | Per-video cap (1–50) |
 | `DOWNLOAD_TIMEOUT_SEC` | `120` | Kill yt-dlp (and its ffmpeg children) after this |
 | `WORKER_THREADS` | `2` | Parallel downloads |
+| `MAX_QUEUED_LINKS` | `20` | Bounded job queue; overflow is dropped with a log |
+| `RATE_LIMIT_PER_MINUTE` | `10` | Per chat; `0` disables |
 | `DOWNLOAD_DIR` | `/tmp/shortsbot` | Temp dir, emptied on startup |
 | `YTDLP_PATH` | `yt-dlp` | Binary |
 | `YTDLP_COOKIES_FILE` | empty | Netscape cookies; a per-job copy is passed (yt-dlp writes cookies back on exit) |
-| `YTDLP_AUTO_UPDATE` | `false` | `yt-dlp -U` on startup |
+| `YTDLP_AUTO_UPDATE` | `false` | `yt-dlp -U` on startup and every 24 h |
 | `REPLY_WITH_ERRORS` | `true` | Short reply when something can't be fetched |
 | `VPN_ENABLED` / `VPN_SS_URL` | `false` / empty | Phase 7; enabling without a URL is a config error; currently only warns "not supported yet" |
 | `LOG_LEVEL` | `INFO` | Logback root level |
@@ -123,7 +127,8 @@ Command (args list, never a shell string):
 yt-dlp --no-progress --no-warnings --no-colors --restrict-filenames --socket-timeout 20
   --match-filter "duration <=? MAX_DURATION_SEC"      (<=? lets unknown durations through, e.g. Instagram)
   --max-filesize MAX_FILE_MB M
-  -S "vcodec:h264,res:720,ext:mp4:m4a"                (H.264 plays inline everywhere; TikTok defaults to H.265)
+  -S "vcodec:h264,res:720,ext:mp4:m4a"                (H.264 plays inline everywhere; TikTok defaults to H.265;
+                                                       on TOO_LARGE the whole download is retried once with res:480)
   --merge-output-format mp4 --remux-video mp4
   --write-info-json --no-write-playlist-metafiles
   -o "<workdir>/item-%(playlist_index|0)s.%(ext)s"
@@ -144,7 +149,9 @@ Gotchas learned from real runs:
 - gallery-dl was rejected (needs Instagram login); the Instagram embed page carries no data without running JS.
 
 ### Sending (phases 5, 5b)
-- Each link → job on a fixed pool of `WORKER_THREADS`; chat action `upload_video` (`upload_photo` for posts) every 4 s.
+- Each link → rate limit check (per chat) → job on a pool of `WORKER_THREADS` with a queue of `MAX_QUEUED_LINKS`;
+  chat action `upload_video` (`upload_photo` for posts) every 4 s.
+- The same `canonicalId` already in flight → the second job waits for the first, then answers from the cache.
 - Cache hit (`SentPost` by `canonicalId`) → resend by file_id instantly; if Telegram rejects the file_id → evict and download.
 - 1 item → `sendVideo` / `sendPhoto`; 2–10 → `sendMediaGroup`. Replies silently (`disable_notification`), with
   `allow_sending_without_reply`, in the same forum topic.
@@ -164,10 +171,15 @@ Gotchas learned from real runs:
 
 - `Dockerfile`, multi-stage:
   - **build** `eclipse-temurin:25-jdk`: `./gradlew shadowJar -x test` with a BuildKit cache mount on `/root/.gradle`.
-  - **runtime** `eclipse-temurin:25-jre` (Ubuntu) + apt `ffmpeg`, `ca-certificates`, `curl`. yt-dlp is the standalone
-    release binary for `TARGETARCH` in `/opt/yt-dlp` (on `PATH`), owned by the non-root user `bot` (uid 10001), so
-    `YTDLP_AUTO_UPDATE` can replace it. `ENTRYPOINT java -XX:MaxRAMPercentage=75 -jar /app/tg-shorts-bot.jar`.
-  - Image is ~1.2 GB, mostly apt ffmpeg and its dependencies (a static ffmpeg build could shrink it; see phase 8).
+  - **tools** stage downloads static `ffmpeg`/`ffprobe` from yt-dlp's FFmpeg-Builds (`ffmpeg-master-latest-<arch>-gpl`)
+    and the standalone yt-dlp binary for `TARGETARCH` (needs curl + xz only there).
+  - **runtime** `eclipse-temurin:25-jre` (Ubuntu, has CA certificates) with no extra apt packages: ffmpeg/ffprobe in
+    `/usr/local/bin`, yt-dlp in `/opt/yt-dlp` (on `PATH`) owned by the non-root user `bot` (uid 10001) so
+    `YTDLP_AUTO_UPDATE` can replace it. `HEALTHCHECK` = heartbeat file younger than 3 min (interval 60 s, start 90 s).
+    `ENTRYPOINT java -XX:MaxRAMPercentage=75 -jar /app/tg-shorts-bot.jar`.
+  - Size: ~700 MB unpacked, 286 MB compressed (apt ffmpeg was 422 MB of layers; static is 267 MB). Docker Desktop's
+    `docker images` shows ~1 GB because it counts compressed + unpacked. johnvansickle.com static ffmpeg would be
+    ~100 MB but is older (7.0) and hosted on a personal site, so it wasn't used.
 - `docker-compose.yml`: service `bot`, `container_name: tg-shorts-bot`, `restart: unless-stopped`, `env_file: .env`,
   `init: true` (tini reaps ffmpeg orphans of killed downloads), `stop_grace_period: 45s` (the bot waits 30 s for
   jobs), `./secrets:/app/secrets:ro` for an optional cookies.txt (a directory, so a missing file can't break startup),
@@ -206,14 +218,23 @@ Countries that block Instagram/TikTok/YouTube often block Telegram too.
 
 ---
 
-## 8. Hardening & polish (after it all works)
+## 8. Hardening & polish (done)
 
-- **Health:** Docker `HEALTHCHECK` on a heartbeat file the poller updates.
-- **yt-dlp freshness:** `YTDLP_AUTO_UPDATE=true` exists; maybe a scheduled self-update while running.
-- **Smaller image:** static ffmpeg build instead of apt ffmpeg (~1.2 GB today).
-- **Abuse limits:** per-chat rate limit (e.g. 10 links/min), bounded job queue (drop with a log when full);
-  dedupe the same link while it's still in flight.
-- **Too-large fallback:** if a video is > `MAX_FILE_MB`, retry once with `-S "res:480"`.
-- **Optional features** (only if wanted): TikTok photo posts (`/photo/`), delete the original message after posting
-  (needs admin + config flag), caption with the poster's name, persistent cache on a volume, configurable reply language.
-- **CI:** GitHub Actions running `./gradlew build` and `docker build`.
+- **Health:** `HeartbeatBackOff` is passed to `TelegramBotsLongPollingApplication` as its back-off supplier. The session
+  calls `reset()` after every successful `getUpdates` (idle polls return every 50 s), so that's where the heartbeat file
+  `/tmp/tg-shorts-bot.heartbeat` is written (at most every 10 s). Docker marks the container unhealthy after ~3 min
+  without a successful poll (network down, revoked token, another instance polling the same token → 409).
+  Plain Docker doesn't restart unhealthy containers; it's for `docker ps`/monitoring.
+- **yt-dlp freshness:** with `YTDLP_AUTO_UPDATE=true`, `yt-dlp -U` runs at startup and every 24 h on a `maintenance` thread
+  (running downloads keep the old binary; the file is replaced atomically).
+- **Smaller image:** static ffmpeg (see phase 6).
+- **Abuse limits:** `RATE_LIMIT_PER_MINUTE` per chat (sliding window, denied links don't count), `ThreadPoolExecutor` with an
+  `ArrayBlockingQueue(MAX_QUEUED_LINKS)` (overflow logged as "too many links waiting"), in-flight dedupe by `canonicalId`.
+- **Too-large fallback:** `YtDlpDownloader` retries a `TOO_LARGE` download once at 480p.
+- **CI: postponed by the user.** Planned: `.github/workflows/ci.yml` running `./gradlew build` and a cached
+  `docker build` (no push) on pushes to main and PRs (actions/checkout@v7, setup-java@v6, gradle/actions/setup-gradle@v6,
+  docker/setup-buildx-action@v4, docker/build-push-action@v7). Pushing workflow files needs a token with the
+  `workflow` scope (`gh auth refresh -s workflow`), which the user's gh login doesn't have yet.
+- **Optional features, not done** (only if wanted): TikTok photo posts (`/photo/`), delete the original message after
+  posting (needs admin + config flag), caption with the poster's name, persistent cache on a volume, configurable reply
+  language, auto-restart on unhealthy (e.g. exit the JVM after N minutes without a poll so `restart: unless-stopped` kicks in).

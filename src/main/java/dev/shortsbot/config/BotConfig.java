@@ -19,6 +19,8 @@ public record BotConfig(
         int maxFileMb,
         Duration downloadTimeout,
         int workerThreads,
+        int maxQueuedLinks,
+        int rateLimitPerMinute,
         Path downloadDir,
         String ytDlpPath,
         Optional<Path> ytDlpCookiesFile,
@@ -41,6 +43,8 @@ public record BotConfig(
                 reader.intInRange("MAX_FILE_MB", 49, 1, 50),
                 Duration.ofSeconds(reader.positiveInt("DOWNLOAD_TIMEOUT_SEC", 120)),
                 reader.positiveInt("WORKER_THREADS", 2),
+                reader.positiveInt("MAX_QUEUED_LINKS", 20),
+                reader.intInRange("RATE_LIMIT_PER_MINUTE", 10, 0, Integer.MAX_VALUE),
                 Path.of(reader.string("DOWNLOAD_DIR", "/tmp/shortsbot")),
                 reader.string("YTDLP_PATH", "yt-dlp"),
                 reader.optional("YTDLP_COOKIES_FILE").map(Path::of),
@@ -67,6 +71,8 @@ public record BotConfig(
                 + ", maxFileMb=" + maxFileMb
                 + ", downloadTimeout=" + downloadTimeout
                 + ", workerThreads=" + workerThreads
+                + ", maxQueuedLinks=" + maxQueuedLinks
+                + ", rateLimitPerMinute=" + (rateLimitPerMinute == 0 ? "<off>" : rateLimitPerMinute)
                 + ", downloadDir=" + downloadDir
                 + ", ytDlpPath=" + ytDlpPath
                 + ", ytDlpCookiesFile=" + ytDlpCookiesFile.map(Path::toString).orElse("<none>")

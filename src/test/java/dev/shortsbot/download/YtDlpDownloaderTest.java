@@ -114,6 +114,30 @@ class YtDlpDownloaderTest {
     }
 
     @Test
+    void retriesAtLowerResolutionWhenTooLarge() throws Exception {
+        var downloader = downloaderWithScript("""
+                case "$*" in
+                  *res:720*) echo '[download] File is larger than max-filesize (60000000 bytes > 51380224 bytes). Aborting.' ;;
+                  *res:480*) printf 'small' > "$(out 0 mp4)"; printf '{"height": 480}' > "$(out 0 info.json)" ;;
+                esac
+                """);
+
+        try (DownloadResult result = downloader.download(LINK)) {
+            assertThat(result.items().getFirst().height()).isEqualTo(480);
+        }
+        assertThat(tmp.resolve("downloads")).as("the failed 720p attempt was cleaned up too").isEmptyDirectory();
+    }
+
+    @Test
+    void reportsTooLargeWhenEvenTheLowerResolutionIs() throws Exception {
+        var downloader = downloaderWithScript(
+                "echo '[download] File is larger than max-filesize (1 bytes > 0 bytes). Aborting.'");
+
+        assertReason(downloader, Reason.TOO_LARGE);
+        assertThat(tmp.resolve("downloads")).isEmptyDirectory();
+    }
+
+    @Test
     void mapsErrorsFromStderr() throws Exception {
         var downloader = downloaderWithScript("""
                 echo '[Instagram] Ddr0y02hRCY: Downloading JSON metadata' >&2

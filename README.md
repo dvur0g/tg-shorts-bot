@@ -7,6 +7,7 @@ the bot downloads it and replies with the video right in the chat, so nobody has
   Instagram reels → the video, as a reply to the message with the link.
 - Instagram posts (`instagram.com/p/…`) → the photo(s)/video(s) as one album **plus the post's text**.
 - The same link posted again is answered instantly from cache.
+- Videos over Telegram's 50 MB limit are retried at 480p.
 - Videos longer than 3 minutes, private/deleted videos etc. get a short explanation instead.
 
 Written in plain Java 25, downloads with [yt-dlp](https://github.com/yt-dlp/yt-dlp) + ffmpeg, all packed into one
@@ -48,8 +49,10 @@ All settings live in `.env` (see `.env.example` for comments). After changing it
 | `MAX_FILE_MB` | `49` | Max video size (Telegram bots can upload up to 50 MB) |
 | `DOWNLOAD_TIMEOUT_SEC` | `120` | Give up on a download after this |
 | `WORKER_THREADS` | `2` | Parallel downloads |
+| `MAX_QUEUED_LINKS` | `20` | Links waiting for a free worker; more are dropped |
+| `RATE_LIMIT_PER_MINUTE` | `10` | Max links per chat per minute (`0` = unlimited) |
 | `YTDLP_COOKIES_FILE` | empty | Cookies for sites that want a login, see below |
-| `YTDLP_AUTO_UPDATE` | `false` | Update yt-dlp every time the bot starts |
+| `YTDLP_AUTO_UPDATE` | `false` | Update yt-dlp when the bot starts and then once a day |
 | `REPLY_WITH_ERRORS` | `true` | Reply with a short reason when something can't be fetched |
 | `LOG_LEVEL` | `INFO` | `DEBUG` also logs message texts and yt-dlp output |
 | `VPN_ENABLED`, `VPN_SS_URL` | `false` | Outline VPN support (work in progress) |
@@ -80,7 +83,10 @@ newest release:
 ```sh
 docker compose build --pull --no-cache && docker compose up -d
 ```
-or set `YTDLP_AUTO_UPDATE=true` to update on every start.
+or set `YTDLP_AUTO_UPDATE=true` to update on start and once a day.
+
+**Health.** The container has a Docker health check: it turns `unhealthy` when the bot hasn't reached Telegram for
+3 minutes. `docker ps` shows the status.
 
 **Debugging a link.** Download it with the same settings the bot uses, without involving Telegram:
 ```sh
