@@ -4,11 +4,11 @@ import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-class FileIdCacheTest {
+class LruCacheTest {
 
     @Test
     void storesAndRemovesEntries() {
-        var cache = new FileIdCache();
+        var cache = new LruCache<String>(10);
         cache.put("youtube:a", "file-a");
 
         assertThat(cache.get("youtube:a")).contains("file-a");
@@ -20,7 +20,7 @@ class FileIdCacheTest {
 
     @Test
     void evictsLeastRecentlyUsedEntry() {
-        var cache = new FileIdCache(2);
+        var cache = new LruCache<String>(2);
         cache.put("a", "1");
         cache.put("b", "2");
         cache.get("a");

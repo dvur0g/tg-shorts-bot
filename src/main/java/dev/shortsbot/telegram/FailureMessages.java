@@ -14,7 +14,7 @@ final class FailureMessages {
         return switch (reason) {
             case TOO_LONG -> "⏱ Too long: I only fetch videos up to " + formatDuration(config.maxDurationSec()) + ".";
             case TOO_LARGE -> "📦 Too big: I can only upload videos up to " + config.maxFileMb() + " MB.";
-            case NOT_A_VIDEO -> "🖼 There's no video in that post.";
+            case NOT_A_VIDEO -> "🤷 Found nothing I can send in that post.";
             case LOGIN_REQUIRED -> "🔒 " + link.platform().displayName() + " wants a login for this one, so I can't fetch it.";
             case UNAVAILABLE -> "🚫 That video is unavailable (private, deleted or region-locked).";
             case TIMEOUT -> "⌛ The download took too long, gave up.";

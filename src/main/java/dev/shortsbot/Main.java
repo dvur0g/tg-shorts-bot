@@ -1,11 +1,12 @@
 package dev.shortsbot;
 
-import dev.shortsbot.cache.FileIdCache;
+import dev.shortsbot.cache.LruCache;
 import dev.shortsbot.config.BotConfig;
 import dev.shortsbot.config.ConfigException;
 import dev.shortsbot.download.YtDlpDownloader;
 import dev.shortsbot.link.LinkExtractor;
 import dev.shortsbot.telegram.LinkProcessor;
+import dev.shortsbot.telegram.SentPost;
 import dev.shortsbot.telegram.ShortsBot;
 import dev.shortsbot.telegram.TelegramChatGateway;
 import dev.shortsbot.telegram.TelegramHttp;
@@ -31,6 +32,7 @@ public final class Main {
     private static final Logger log = LoggerFactory.getLogger(Main.class);
     private static final Duration DOWNLOAD_RETRY_DELAY = Duration.ofSeconds(3);
     private static final Duration SHUTDOWN_GRACE = Duration.ofSeconds(30);
+    private static final int SENT_CACHE_SIZE = 500;
 
     private Main() {
     }
@@ -69,7 +71,8 @@ public final class Main {
                 Thread.ofPlatform().name("chat-action").daemon().factory());
         ExecutorService workers = Executors.newFixedThreadPool(config.workerThreads(),
                 Thread.ofPlatform().name("download-", 1).factory());
-        var processor = new LinkProcessor(config, downloader, chat, new FileIdCache(), scheduler, DOWNLOAD_RETRY_DELAY);
+        var processor = new LinkProcessor(config, downloader, chat, new LruCache<SentPost>(SENT_CACHE_SIZE), scheduler,
+                DOWNLOAD_RETRY_DELAY);
         var bot = new ShortsBot(config, me.getUserName(), new LinkExtractor(), processor, chat, workers);
 
         var application = new TelegramBotsLongPollingApplication();

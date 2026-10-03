@@ -27,14 +27,17 @@ class YtDlpDownloaderTest {
     private static final DetectedLink LINK =
             new DetectedLink(Platform.YOUTUBE, "https://www.youtube.com/shorts/dQw4w9WgXcQ", "youtube:dQw4w9WgXcQ");
 
-    /** Shell snippet that sets $OUT to the value passed after "-o", with %(ext)s resolved for a given extension. */
+    private static final DetectedLink POST =
+            new DetectedLink(Platform.INSTAGRAM, "https://www.instagram.com/p/abc/", "instagram:abc");
+
+    /** Shell snippet defining out INDEX EXT, which prints the path yt-dlp would use for that item and extension. */
     private static final String FIND_OUTPUT = """
             prev=""
             for arg in "$@"; do
               if [ "$prev" = "-o" ]; then template="$arg"; fi
               prev="$arg"
             done
-            out() { echo "$template" | sed "s/%(ext)s/$1/"; }
+            out() { echo "$template" | sed "s/%(playlist_index|0)s/$1/; s/%(ext)s/$2/"; }
             """;
 
     @TempDir
@@ -43,16 +46,20 @@ class YtDlpDownloaderTest {
     @Test
     void downloadsVideoAndReadsMetadata() throws Exception {
         var downloader = downloaderWithScript("""
-                printf 'fake mp4 bytes' > "$(out mp4)"
-                printf '{"width": 720, "height": 1280, "duration": 31.6, "title": "A short"}' > "$(out info.json)"
+                printf 'fake mp4 bytes' > "$(out 0 mp4)"
+                printf '{"width": 720, "height": 1280, "duration": 31.6, "title": "A short", "formats": [{}]}' \\
+                  > "$(out 0 info.json)"
                 """);
 
         DownloadResult result = downloader.download(LINK);
-        assertThat(result.file()).hasFileName("video.mp4").hasContent("fake mp4 bytes");
-        assertThat(result.sizeBytes()).isEqualTo(14);
-        assertThat(result.width()).isEqualTo(720);
-        assertThat(result.height()).isEqualTo(1280);
-        assertThat(result.durationSec()).isEqualTo(32);
+        assertThat(result.items()).singleElement().satisfies(item -> {
+            assertThat(item.type()).isEqualTo(MediaType.VIDEO);
+            assertThat(item.file()).hasFileName("item-0.mp4").hasContent("fake mp4 bytes");
+            assertThat(item.sizeBytes()).isEqualTo(14);
+            assertThat(item.width()).isEqualTo(720);
+            assertThat(item.height()).isEqualTo(1280);
+            assertThat(item.durationSec()).isEqualTo(32);
+        });
         assertThat(result.title()).isEqualTo("A short");
         assertThat(result.workDir().getParent()).isEqualTo(tmp.resolve("downloads"));
         assertThat(result.workDir()).exists();
@@ -63,12 +70,16 @@ class YtDlpDownloaderTest {
 
     @Test
     void toleratesMissingMetadata() throws Exception {
-        var downloader = downloaderWithScript("printf 'x' > \"$(out mp4)\"");
+        var downloader = downloaderWithScript("""
+                printf 'x' > "$(out 0 mp4)"
+                printf '{}' > "$(out 0 info.json)"
+                """);
 
         try (DownloadResult result = downloader.download(LINK)) {
-            assertThat(result.width()).isZero();
-            assertThat(result.durationSec()).isZero();
+            assertThat(result.items().getFirst().width()).isZero();
+            assertThat(result.items().getFirst().durationSec()).isZero();
             assertThat(result.title()).isEmpty();
+            assertThat(result.caption()).isEmpty();
         }
     }
 
@@ -84,7 +95,7 @@ class YtDlpDownloaderTest {
     @Test
     void reportsVideosRejectedBySizeLimitAndIgnoresPartialFiles() throws Exception {
         var downloader = downloaderWithScript("""
-                printf 'partial' > "$(out f616.mp4)"
+                printf 'partial' > "$(out 0 f616.mp4)"
                 echo '[download] File is larger than max-filesize (349653 bytes > 102400 bytes). Aborting.'
                 """);
 
@@ -94,8 +105,10 @@ class YtDlpDownloaderTest {
 
     @Test
     void enforcesSizeLimitOnTheFinalFile() throws Exception {
-        var downloader = downloaderWithScript(
-                "head -c 2097152 /dev/zero > \"$(out mp4)\"", "MAX_FILE_MB", "1");
+        var downloader = downloaderWithScript("""
+                head -c 2097152 /dev/zero > "$(out 0 mp4)"
+                printf '{}' > "$(out 0 info.json)"
+                """, "MAX_FILE_MB", "1");
 
         assertReason(downloader, Reason.TOO_LARGE);
     }
@@ -138,13 +151,14 @@ class YtDlpDownloaderTest {
         var downloader = downloaderWithScript("""
                 prev=""
                 for arg in "$@"; do
-                  if [ "$prev" = "--cookies" ]; then cp "$arg" "$(out mp4)"; fi
+                  if [ "$prev" = "--cookies" ]; then cp "$arg" "$(out 0 mp4)"; fi
                   prev="$arg"
                 done
+                printf '{}' > "$(out 0 info.json)"
                 """, "YTDLP_COOKIES_FILE", cookies.toString());
 
         try (DownloadResult result = downloader.download(LINK)) {
-            assertThat(result.file()).hasContent("# Netscape HTTP Cookie File");
+            assertThat(result.items().getFirst().file()).hasContent("# Netscape HTTP Cookie File");
         }
     }
 
@@ -159,9 +173,89 @@ class YtDlpDownloaderTest {
                 .containsSubsequence("--max-filesize", "20M")
                 .containsSubsequence("-S", "vcodec:h264,res:720,ext:mp4:m4a")
                 .containsSubsequence("--merge-output-format", "mp4")
-                .containsSubsequence("-o", "/work/video.%(ext)s")
+                .containsSubsequence("-o", "/work/item-%(playlist_index|0)s.%(ext)s")
+                .containsSubsequence("--no-playlist", "--playlist-items", "1")
                 .containsSubsequence("--cookies", "/work/cookies.txt")
+                .doesNotContain("--write-thumbnail", "--ignore-no-formats-error")
                 .endsWith("--", LINK.url());
+    }
+
+    @Test
+    void buildsCommandThatFetchesWholeInstagramPosts() {
+        var command = new YtDlpDownloader(config()).buildCommand(POST, Path.of("/work"), Optional.empty());
+
+        assertThat(command)
+                .containsSubsequence("--playlist-items", "1:10")
+                .contains("--ignore-no-formats-error", "--write-thumbnail")
+                .containsSubsequence("--convert-thumbnails", "jpg")
+                .doesNotContain("--no-playlist")
+                .endsWith("--", POST.url());
+    }
+
+    @Test
+    void collectsPhotosAndVideosOfAPostInOrderWithItsText() throws Exception {
+        var downloader = downloaderWithScript("""
+                printf 'jpg1' > "$(out 1 jpg)"
+                printf '{"description": "  Post text  ", "title": "Post by someone", "formats": []}' > "$(out 1 info.json)"
+                printf 'mp4' > "$(out 2 mp4)"
+                printf 'thumb' > "$(out 2 jpg)"
+                printf '{"description": "Post text", "width": 720, "height": 1280, "duration": 5, "formats": [{}]}' \\
+                  > "$(out 2 info.json)"
+                printf 'jpg3' > "$(out 10 jpg)"
+                printf '{"description": "Post text"}' > "$(out 10 info.json)"
+                echo 'ERROR: [Instagram] abc: No video formats found!' >&2
+                exit 1
+                """);
+
+        try (DownloadResult result = downloader.download(POST)) {
+            assertThat(result.items()).extracting(item -> item.file().getFileName().toString())
+                    .containsExactly("item-1.jpg", "item-2.mp4", "item-10.jpg");
+            assertThat(result.items()).extracting(MediaItem::type)
+                    .containsExactly(MediaType.PHOTO, MediaType.VIDEO, MediaType.PHOTO);
+            assertThat(result.caption()).isEqualTo("Post text");
+            assertThat(result.title()).isEqualTo("Post by someone");
+        }
+    }
+
+    @Test
+    void skipsVideosOfAPostThatWereNotDownloaded() throws Exception {
+        // A video rejected by the duration filter leaves only its thumbnail behind; that must not be sent as a photo.
+        var downloader = downloaderWithScript("""
+                printf 'jpg' > "$(out 1 jpg)"
+                printf '{"formats": []}' > "$(out 1 info.json)"
+                printf 'thumb' > "$(out 2 jpg)"
+                printf '{"formats": [{}]}' > "$(out 2 info.json)"
+                """);
+
+        try (DownloadResult result = downloader.download(POST)) {
+            assertThat(result.items()).extracting(MediaItem::type).containsExactly(MediaType.PHOTO);
+        }
+    }
+
+    @Test
+    void reportsPostsWithNothingToSend() throws Exception {
+        var downloader = downloaderWithScript("""
+                echo 'ERROR: [Instagram] abc: No video formats found!' >&2
+                exit 1
+                """);
+
+        assertThatThrownBy(() -> downloader.download(POST))
+                .isInstanceOfSatisfying(DownloadException.class, e -> assertThat(e.reason()).isEqualTo(Reason.NOT_A_VIDEO));
+    }
+
+    @Test
+    void dropsPhotosOverTheTelegramLimit() throws Exception {
+        var downloader = downloaderWithScript("""
+                head -c 11534336 /dev/zero > "$(out 1 jpg)"
+                printf '{"formats": []}' > "$(out 1 info.json)"
+                printf 'small' > "$(out 2 jpg)"
+                printf '{"formats": []}' > "$(out 2 info.json)"
+                """);
+
+        try (DownloadResult result = downloader.download(POST)) {
+            assertThat(result.items()).extracting(item -> item.file().getFileName().toString())
+                    .containsExactly("item-2.jpg");
+        }
     }
 
     @Test

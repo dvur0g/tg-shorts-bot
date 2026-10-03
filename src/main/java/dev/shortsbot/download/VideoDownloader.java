@@ -5,9 +5,10 @@ import dev.shortsbot.link.DetectedLink;
 public interface VideoDownloader {
 
     /**
-     * Downloads the video into a fresh temporary directory. The caller must close the result to delete it.
+     * Downloads the video (or the photos and videos of an Instagram post) into a fresh temporary directory.
+     * The caller must close the result to delete it.
      *
-     * @throws DownloadException if the video can't be downloaded or doesn't fit the configured limits
+     * @throws DownloadException if nothing could be downloaded or nothing fits the configured limits
      */
     DownloadResult download(DetectedLink link) throws DownloadException, InterruptedException;
 }

@@ -3,6 +3,8 @@ package dev.shortsbot;
 import dev.shortsbot.config.BotConfig;
 import dev.shortsbot.download.DownloadException;
 import dev.shortsbot.download.DownloadResult;
+import dev.shortsbot.download.MediaItem;
+import dev.shortsbot.download.MediaType;
 import dev.shortsbot.download.YtDlpDownloader;
 import dev.shortsbot.link.DetectedLink;
 import dev.shortsbot.link.LinkExtractor;
@@ -43,11 +45,21 @@ public final class DownloadCli {
             for (DetectedLink link : links) {
                 long started = System.currentTimeMillis();
                 try (DownloadResult result = downloader.download(link)) {
-                    Path target = outputDir.resolve(link.canonicalId().replace(':', '_') + ".mp4");
-                    Files.copy(result.file(), target, StandardCopyOption.REPLACE_EXISTING);
-                    System.out.printf("OK    %s -> %s (%.1f MB, %dx%d, %ds, %d ms) %s%n",
-                            link.url(), target, result.sizeBytes() / 1048576.0, result.width(), result.height(),
-                            result.durationSec(), System.currentTimeMillis() - started, result.title());
+                    System.out.printf("OK    %s (%d item(s), %d ms) %s%n", link.url(), result.items().size(),
+                            System.currentTimeMillis() - started, result.title());
+                    int index = 1;
+                    for (MediaItem item : result.items()) {
+                        String name = link.canonicalId().replace(':', '_')
+                                + (result.items().size() > 1 ? "-" + index++ : "")
+                                + (item.type() == MediaType.PHOTO ? ".jpg" : ".mp4");
+                        Path target = outputDir.resolve(name);
+                        Files.copy(item.file(), target, StandardCopyOption.REPLACE_EXISTING);
+                        System.out.printf("        %s -> %s (%.1f MB, %dx%d, %ds)%n", item.type(), target,
+                                item.sizeBytes() / 1048576.0, item.width(), item.height(), item.durationSec());
+                    }
+                    if (!result.caption().isEmpty()) {
+                        System.out.println("        text: " + result.caption().replace('\n', ' '));
+                    }
                 } catch (DownloadException e) {
                     failures++;
                     System.out.printf("FAIL  %s: %s - %s%n", link.url(), e.reason(), e.getMessage());

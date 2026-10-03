@@ -1,6 +1,6 @@
 package dev.shortsbot.telegram;
 
-import dev.shortsbot.cache.FileIdCache;
+import dev.shortsbot.cache.LruCache;
 import dev.shortsbot.config.BotConfig;
 import dev.shortsbot.download.DownloadException;
 import dev.shortsbot.download.DownloadException.Reason;
@@ -97,7 +97,7 @@ class ShortsBotTest {
         var processor = new LinkProcessor(config, link -> {
             downloadedUrls.add(link.url());
             throw new DownloadException(Reason.UNAVAILABLE, "test");
-        }, chat, new FileIdCache(), scheduler, Duration.ZERO);
+        }, chat, new LruCache<>(10), scheduler, Duration.ZERO);
         return new ShortsBot(config, "shorts_test_bot", new LinkExtractor(), processor, chat, workers);
     }
 

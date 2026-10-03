@@ -1,20 +1,28 @@
 package dev.shortsbot.telegram;
 
-import dev.shortsbot.download.DownloadResult;
+import dev.shortsbot.download.MediaType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.telegram.telegrambots.meta.api.methods.ActionType;
 import org.telegram.telegrambots.meta.api.methods.send.SendChatAction;
+import org.telegram.telegrambots.meta.api.methods.send.SendMediaGroup;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
 import org.telegram.telegrambots.meta.api.methods.send.SendVideo;
 import org.telegram.telegrambots.meta.api.objects.InputFile;
 import org.telegram.telegrambots.meta.api.objects.ReplyParameters;
+import org.telegram.telegrambots.meta.api.objects.media.InputMedia;
+import org.telegram.telegrambots.meta.api.objects.media.InputMediaPhoto;
+import org.telegram.telegrambots.meta.api.objects.media.InputMediaVideo;
 import org.telegram.telegrambots.meta.api.objects.message.Message;
+import org.telegram.telegrambots.meta.api.objects.photo.PhotoSize;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiRequestException;
 import org.telegram.telegrambots.meta.generics.TelegramClient;
 
-import java.util.Optional;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 
 public class TelegramChatGateway implements ChatGateway {
 
@@ -30,11 +38,28 @@ public class TelegramChatGateway implements ChatGateway {
     }
 
     @Override
-    public Optional<String> sendVideo(ReplyTarget target, DownloadResult video) throws TelegramApiException, InterruptedException {
+    public List<String> sendMedia(ReplyTarget target, List<OutgoingMedia> media, String caption)
+            throws TelegramApiException, InterruptedException {
+        if (media.isEmpty()) {
+            throw new IllegalArgumentException("Nothing to send");
+        }
+        if (media.size() > 1) {
+            return sendAlbum(target, media, caption);
+        }
+        OutgoingMedia item = media.getFirst();
+        Message sent = item.type() == MediaType.PHOTO ? sendPhoto(target, item, caption) : sendVideo(target, item, caption);
+        var fileIds = new ArrayList<String>();
+        fileIds.add(fileIdOf(sent));
+        return fileIds;
+    }
+
+    private Message sendVideo(ReplyTarget target, OutgoingMedia video, String caption)
+            throws TelegramApiException, InterruptedException {
         var builder = SendVideo.builder()
                 .chatId(target.chatId())
                 .messageThreadId(target.threadId())
-                .video(new InputFile(video.file().toFile(), video.file().getFileName().toString()))
+                .video(inputFile(video))
+                .caption(caption)
                 .supportsStreaming(true)
                 .disableNotification(true)
                 .replyParameters(replyTo(target));
@@ -45,20 +70,67 @@ public class TelegramChatGateway implements ChatGateway {
             builder.duration(video.durationSec());
         }
         SendVideo request = builder.build();
-        return fileIdOf(withRateLimitRetry(() -> client.execute(request)));
+        return withRateLimitRetry(() -> client.execute(request));
     }
 
-    @Override
-    public void sendVideo(ReplyTarget target, String fileId) throws TelegramApiException, InterruptedException {
-        SendVideo request = SendVideo.builder()
+    private Message sendPhoto(ReplyTarget target, OutgoingMedia photo, String caption)
+            throws TelegramApiException, InterruptedException {
+        SendPhoto request = SendPhoto.builder()
                 .chatId(target.chatId())
                 .messageThreadId(target.threadId())
-                .video(new InputFile(fileId))
-                .supportsStreaming(true)
+                .photo(inputFile(photo))
+                .caption(caption)
                 .disableNotification(true)
                 .replyParameters(replyTo(target))
                 .build();
-        withRateLimitRetry(() -> client.execute(request));
+        return withRateLimitRetry(() -> client.execute(request));
+    }
+
+    private List<String> sendAlbum(ReplyTarget target, List<OutgoingMedia> media, String caption)
+            throws TelegramApiException, InterruptedException {
+        var inputs = new ArrayList<InputMedia>();
+        for (OutgoingMedia item : media) {
+            // Telegram shows the caption of the first item as the album's caption.
+            inputs.add(inputMedia(item, inputs.isEmpty() ? caption : null));
+        }
+        SendMediaGroup request = SendMediaGroup.builder()
+                .chatId(target.chatId())
+                .messageThreadId(target.threadId())
+                .medias(inputs)
+                .disableNotification(true)
+                .replyParameters(replyTo(target))
+                .build();
+        List<Message> sent = withRateLimitRetry(() -> client.execute(request));
+        var fileIds = new ArrayList<String>();
+        for (int i = 0; i < media.size(); i++) {
+            fileIds.add(i < sent.size() ? fileIdOf(sent.get(i)) : null);
+        }
+        return fileIds;
+    }
+
+    private static InputMedia inputMedia(OutgoingMedia item, String caption) {
+        if (item.type() == MediaType.PHOTO) {
+            var builder = InputMediaPhoto.builder().caption(caption);
+            if (item.isUpload()) {
+                builder.media(item.file().toFile(), item.file().getFileName().toString());
+            } else {
+                builder.media(item.fileId());
+            }
+            return builder.build();
+        }
+        var builder = InputMediaVideo.builder().caption(caption).supportsStreaming(true);
+        if (item.isUpload()) {
+            builder.media(item.file().toFile(), item.file().getFileName().toString());
+        } else {
+            builder.media(item.fileId());
+        }
+        if (item.width() > 0 && item.height() > 0) {
+            builder.width(item.width()).height(item.height());
+        }
+        if (item.durationSec() > 0) {
+            builder.duration(item.durationSec());
+        }
+        return builder.build();
     }
 
     @Override
@@ -74,13 +146,19 @@ public class TelegramChatGateway implements ChatGateway {
     }
 
     @Override
-    public void showUploadingVideo(ReplyTarget target) throws TelegramApiException, InterruptedException {
+    public void showUploading(ReplyTarget target, MediaType type) throws TelegramApiException, InterruptedException {
         SendChatAction request = SendChatAction.builder()
                 .chatId(target.chatId())
                 .messageThreadId(target.threadId())
-                .action(ActionType.UPLOAD_VIDEO.toString())
+                .action((type == MediaType.PHOTO ? ActionType.UPLOAD_PHOTO : ActionType.UPLOAD_VIDEO).toString())
                 .build();
         withRateLimitRetry(() -> client.execute(request));
+    }
+
+    private static InputFile inputFile(OutgoingMedia media) {
+        return media.isUpload()
+                ? new InputFile(media.file().toFile(), media.file().getFileName().toString())
+                : new InputFile(media.fileId());
     }
 
     private static ReplyParameters replyTo(ReplyTarget target) {
@@ -90,15 +168,24 @@ public class TelegramChatGateway implements ChatGateway {
                 .build();
     }
 
-    /** Telegram may answer a video without audio as an animation (GIF); its file_id still works for resending. */
-    private static Optional<String> fileIdOf(Message sent) {
+    /**
+     * For photos Telegram returns several sizes; the largest one's file_id resends the photo in full quality.
+     * A video without audio may come back as an animation (GIF); its file_id still works for resending.
+     */
+    private static String fileIdOf(Message sent) {
         if (sent.getVideo() != null) {
-            return Optional.of(sent.getVideo().getFileId());
+            return sent.getVideo().getFileId();
+        }
+        if (sent.getPhoto() != null && !sent.getPhoto().isEmpty()) {
+            return sent.getPhoto().stream()
+                    .max(Comparator.comparingLong(size -> (long) size.getWidth() * size.getHeight()))
+                    .map(PhotoSize::getFileId)
+                    .orElse(null);
         }
         if (sent.getAnimation() != null) {
-            return Optional.of(sent.getAnimation().getFileId());
+            return sent.getAnimation().getFileId();
         }
-        return Optional.empty();
+        return null;
     }
 
     private static <T> T withRateLimitRetry(TelegramCall<T> call) throws TelegramApiException, InterruptedException {

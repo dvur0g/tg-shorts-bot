@@ -19,6 +19,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /** Downloads videos by running the yt-dlp command line tool (which uses ffmpeg to merge streams). */
@@ -26,9 +28,13 @@ public class YtDlpDownloader implements VideoDownloader {
 
     private static final Logger log = LoggerFactory.getLogger(YtDlpDownloader.class);
 
-    static final String OUTPUT_NAME = "video";
-    static final String VIDEO_FILE = OUTPUT_NAME + ".mp4";
-    static final String INFO_FILE = OUTPUT_NAME + ".info.json";
+    /** Every item of a post becomes item-N.mp4 / item-N.jpg / item-N.info.json; single videos are item-0. */
+    static final String OUTPUT_TEMPLATE = "item-%(playlist_index|0)s.%(ext)s";
+    private static final Pattern INFO_FILE = Pattern.compile("item-(\\d+)\\.info\\.json");
+    /** Telegram's Bot API upload limits are 50 MB per video and 10 MB per photo. */
+    private static final long MAX_PHOTO_BYTES = 10L * 1024 * 1024;
+    /** A Telegram album holds at most 10 items. */
+    static final int MAX_POST_ITEMS = 10;
     private static final String STDOUT_FILE = "yt-dlp.out";
     private static final String STDERR_FILE = "yt-dlp.err";
     private static final Duration KILL_GRACE = Duration.ofSeconds(5);
@@ -103,22 +109,68 @@ public class YtDlpDownloader implements VideoDownloader {
         log.debug("yt-dlp exited with {} after {} ms\nstdout:\n{}\nstderr:\n{}",
                 exitCode, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), stdout, stderr);
 
-        if (exitCode != 0) {
-            throw classifyError(stderr, exitCode);
+        // Success is judged by the files produced, not the exit code: for an Instagram post with photos
+        // yt-dlp reports "No video formats found" and exits with 1 even though the photos were saved.
+        var items = new ArrayList<MediaItem>();
+        var infos = new ArrayList<JsonNode>();
+        boolean droppedTooLarge = false;
+        for (int index : itemIndexes(workDir)) {
+            JsonNode info = readInfo(workDir.resolve("item-" + index + ".info.json"));
+            Optional<MediaItem> item = collectItem(workDir, index, info);
+            if (item.isEmpty()) {
+                continue;
+            }
+            if (item.get().sizeBytes() > maxBytes(item.get().type())) {
+                log.info("Skipping {} ({} KB): over the Telegram upload limit", item.get().file().getFileName(),
+                        item.get().sizeBytes() / 1024);
+                droppedTooLarge = true;
+                continue;
+            }
+            items.add(item.get());
+            infos.add(info);
         }
 
-        Path video = workDir.resolve(VIDEO_FILE);
-        if (!Files.isRegularFile(video)) {
-            throw classifySkip(stdout);
+        if (items.isEmpty()) {
+            if (droppedTooLarge) {
+                throw new DownloadException(Reason.TOO_LARGE, "Larger than the " + config.maxFileMb() + " MB limit");
+            }
+            throw exitCode != 0 ? classifyError(stderr, exitCode) : classifySkip(stdout);
         }
+        JsonNode first = infos.getFirst();
+        return new DownloadResult(items, first.path("description").asText("").strip(), first.path("title").asText(""), workDir);
+    }
 
-        long size = sizeOf(video);
-        if (size > maxFileBytes()) {
-            throw new DownloadException(Reason.TOO_LARGE,
-                    "Video is " + size / (1024 * 1024) + " MB, limit is " + config.maxFileMb() + " MB");
+    private static List<Integer> itemIndexes(Path workDir) throws DownloadException {
+        try (Stream<Path> files = Files.list(workDir)) {
+            return files
+                    .map(file -> INFO_FILE.matcher(file.getFileName().toString()))
+                    .filter(Matcher::matches)
+                    .map(matcher -> Integer.parseInt(matcher.group(1)))
+                    .sorted()
+                    .toList();
+        } catch (IOException e) {
+            throw new DownloadException(Reason.UNKNOWN, "Can't list downloaded files", e);
         }
+    }
 
-        JsonNode info = readInfo(workDir.resolve(INFO_FILE));
+    /**
+     * An item is a video if yt-dlp saved item-N.mp4. Otherwise, if the item has no video formats at all, it is a
+     * photo, saved as item-N.jpg by --write-thumbnail. Anything else (e.g. a video skipped by the duration filter,
+     * which leaves only its thumbnail) is not sendable.
+     */
+    private Optional<MediaItem> collectItem(Path workDir, int index, JsonNode info) throws DownloadException, InterruptedException {
+        Path video = workDir.resolve("item-" + index + ".mp4");
+        if (Files.isRegularFile(video)) {
+            return Optional.of(videoItem(video, info));
+        }
+        Path photo = workDir.resolve("item-" + index + ".jpg");
+        if (Files.isRegularFile(photo) && info.path("formats").isEmpty()) {
+            return Optional.of(new MediaItem(MediaType.PHOTO, photo, sizeOf(photo), 0, 0, 0));
+        }
+        return Optional.empty();
+    }
+
+    private MediaItem videoItem(Path video, JsonNode info) throws DownloadException, InterruptedException {
         int width = info.path("width").asInt(0);
         int height = info.path("height").asInt(0);
         int duration = (int) Math.round(info.path("duration").asDouble(0));
@@ -130,7 +182,7 @@ public class YtDlpDownloader implements VideoDownloader {
             height = height != 0 ? height : stream.path("height").asInt(0);
             duration = duration != 0 ? duration : (int) Math.round(probe.path("format").path("duration").asDouble(0));
         }
-        return new DownloadResult(video, size, width, height, duration, info.path("title").asText(""), workDir);
+        return new MediaItem(MediaType.VIDEO, video, sizeOf(video), width, height, duration);
     }
 
     private JsonNode probe(Path video) throws InterruptedException {
@@ -150,8 +202,6 @@ public class YtDlpDownloader implements VideoDownloader {
     List<String> buildCommand(DetectedLink link, Path workDir, Optional<Path> cookiesFile) {
         var command = new ArrayList<>(List.of(
                 config.ytDlpPath(),
-                "--no-playlist",
-                "--playlist-items", "1",
                 "--no-progress",
                 "--no-warnings",
                 "--no-colors",
@@ -164,7 +214,19 @@ public class YtDlpDownloader implements VideoDownloader {
                 "--merge-output-format", "mp4",
                 "--remux-video", "mp4",
                 "--write-info-json",
-                "-o", workDir.resolve(OUTPUT_NAME + ".%(ext)s").toString()));
+                "--no-write-playlist-metafiles",
+                "-o", workDir.resolve(OUTPUT_TEMPLATE).toString()));
+        if (link.isInstagramPost()) {
+            // A post may be a carousel of photos and videos. Photos have no formats, so yt-dlp must not give up
+            // on them; their full-size image is the "thumbnail", which yt-dlp downloads through the same proxy.
+            command.addAll(List.of(
+                    "--playlist-items", "1:" + MAX_POST_ITEMS,
+                    "--ignore-no-formats-error",
+                    "--write-thumbnail",
+                    "--convert-thumbnails", "jpg"));
+        } else {
+            command.addAll(List.of("--no-playlist", "--playlist-items", "1"));
+        }
         cookiesFile.ifPresent(cookies -> command.addAll(List.of("--cookies", cookies.toString())));
         command.add("--");
         command.add(link.url());
@@ -272,7 +334,7 @@ public class YtDlpDownloader implements VideoDownloader {
         if (stdout.contains("larger than max-filesize")) {
             return new DownloadException(Reason.TOO_LARGE, "Video is larger than " + config.maxFileMb() + " MB");
         }
-        return new DownloadException(Reason.UNKNOWN, "yt-dlp finished without producing a video");
+        return new DownloadException(Reason.UNKNOWN, "yt-dlp finished without producing anything to send");
     }
 
     private static Optional<String> lastErrorLine(String stderr) {
@@ -300,8 +362,8 @@ public class YtDlpDownloader implements VideoDownloader {
         }
     }
 
-    private long maxFileBytes() {
-        return config.maxFileMb() * 1024L * 1024L;
+    private long maxBytes(MediaType type) {
+        return type == MediaType.PHOTO ? MAX_PHOTO_BYTES : config.maxFileMb() * 1024L * 1024L;
     }
 
     private static long sizeOf(Path file) throws DownloadException {
