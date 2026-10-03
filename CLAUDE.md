@@ -4,7 +4,7 @@ A Telegram bot that sits in a friends' group chat, notices YouTube Shorts / Inst
 downloads the media and posts it back into the chat as a reply to the original message.
 
 - **Language:** plain Java 25 (no Spring, no DI framework). Small, well-known libraries only.
-- **Run (target):** `docker compose up -d`, one command, nothing else to install on the host (phase 6).
+- **Run:** `docker compose up -d`, one command, nothing else to install on the host. Container name: `tg-shorts-bot`.
 - **VPN (phase 7):** optional, off by default, toggled by `VPN_ENABLED=true` + an Outline `ss://` key.
 
 ## Status
@@ -17,8 +17,8 @@ downloads the media and posts it back into the chat as a reply to the original m
 | 4 | Downloading with yt-dlp | ✅ done, verified with real links |
 | 5 | Sending to the chat, cache, errors, concurrency | ✅ done, verified in the test group |
 | 5b | Instagram `/p/` posts: photos/albums + post text | ✅ done, verified in the test group |
-| 6 | Dockerfile + docker-compose + README | ⏳ next |
-| 7 | Outline / Shadowsocks VPN toggle | planned |
+| 6 | Dockerfile + docker-compose + README | ✅ done, bot runs via compose |
+| 7 | Outline / Shadowsocks VPN toggle | ⏳ next |
 | 8 | Hardening & polish | planned |
 
 Each phase is one commit (fixes found while testing a phase go into that phase's commit or a follow-up).
@@ -30,18 +30,12 @@ Tests must stay green. Push to GitHub only when the user asks.
 
 - Build + all tests: `./gradlew build` → `build/libs/tg-shorts-bot.jar` (shadow/fat jar). ~90 unit tests, no network.
 - The host has Java 25 but **no yt-dlp/ffmpeg** and no Gradle install (the wrapper downloads Gradle).
-  Until phase 6 exists, real downloads/bot runs use a throwaway image built from:
-  ```dockerfile
-  FROM eclipse-temurin:25-jre
-  ARG TARGETARCH
-  RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl && rm -rf /var/lib/apt/lists/* \
-   && if [ "$TARGETARCH" = "arm64" ]; then f=yt-dlp_linux_aarch64; else f=yt-dlp_linux; fi \
-   && curl -fsSL -o /usr/local/bin/yt-dlp "https://github.com/yt-dlp/yt-dlp/releases/latest/download/$f" && chmod +x /usr/local/bin/yt-dlp
-  ```
-  - Debug downloads: `docker run --rm -v "$PWD":/w -w /w <image> java -cp build/libs/tg-shorts-bot.jar dev.shortsbot.DownloadCli <url>...`
-    (saves to `downloads/`, git-ignored; prints items, sizes, dimensions and post text).
-  - Run the bot: `docker run -d --name shortsbot-dev-run --env-file .env -v <jar>:/app/tg-shorts-bot.jar:ro <image> java -jar /app/tg-shorts-bot.jar`.
-    Don't rebuild a jar that a running JVM uses; copy it elsewhere or restart the bot.
+  Real downloads and bot runs happen in Docker:
+  - Run / redeploy the bot: `docker compose up -d --build` (container `tg-shorts-bot`, service `bot`).
+    Only one instance may poll a token at a time, so stop any other copy first.
+  - Logs: `docker compose logs -f` (or `docker logs tg-shorts-bot`).
+  - Debug downloads: `docker compose exec -w /tmp bot java -cp /app/tg-shorts-bot.jar dev.shortsbot.DownloadCli <url>...`
+    (prints items, sizes, dimensions and post text; files land in the container's `/tmp/downloads`).
 - `.env` holds the real `BOT_TOKEN` and `ALLOWED_CHAT_IDS` (test group `-5230348538`, a basic group; if Telegram
   converts it to a supergroup the id changes to `-100…` and the bot logs "Ignoring messages from chat …").
   `.env`, `cookies.txt`, `secrets/` are git-ignored and must never be committed.
@@ -164,41 +158,25 @@ Gotchas learned from real runs:
 
 ---
 
-## 6. Docker + one-command start (next)
+## 6. Docker + one-command start (done)
 
 **Goal:** `docker compose up -d` is the only thing needed on a machine with Docker.
 
-`Dockerfile` (multi-stage):
-1. **build stage** `eclipse-temurin:25-jdk`: copy `gradlew`, `gradle/`, `settings.gradle.kts`, `build.gradle.kts`
-   first and resolve dependencies (layer cache), then sources, `./gradlew shadowJar --no-daemon -x test`.
-   BuildKit cache mount for `/root/.gradle`.
-2. **runtime stage** `eclipse-temurin:25-jre`, the same as the dev image above (ffmpeg, ca-certificates, yt-dlp standalone
-   binary by `TARGETARCH`), plus: non-root user that owns the yt-dlp binary (so `YTDLP_AUTO_UPDATE` works),
-   `WORKDIR /app`, copy jar, `ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "/app/tg-shorts-bot.jar"]`.
-
-`docker-compose.yml`:
-```yaml
-services:
-  bot:
-    build: .
-    image: tg-shorts-bot:latest
-    restart: unless-stopped
-    env_file: .env
-    volumes:
-      - ./secrets:/app/secrets:ro     # optional cookies.txt → YTDLP_COOKIES_FILE=/app/secrets/cookies.txt
-    tmpfs:
-      - /tmp/shortsbot:size=512m
-    logging:
-      driver: json-file
-      options: { max-size: "10m", max-file: "3" }
-```
-Mount a directory, not a single file, so a missing cookies file doesn't break startup (the bot already just warns).
-
-`README.md`: what the bot does, BotFather steps (privacy mode!), `cp .env.example .env`, `docker compose up -d`,
-`docker compose logs -f`, getting the chat id from the logs, exporting Instagram cookies, updating yt-dlp
-(`docker compose build --pull --no-cache && docker compose up -d`), `DownloadCli` for debugging.
-
-**Checkpoint:** with only Docker: clone → fill `.env` → `docker compose up -d` → bot works in the group.
+- `Dockerfile`, multi-stage:
+  - **build** `eclipse-temurin:25-jdk`: `./gradlew shadowJar -x test` with a BuildKit cache mount on `/root/.gradle`.
+  - **runtime** `eclipse-temurin:25-jre` (Ubuntu) + apt `ffmpeg`, `ca-certificates`, `curl`. yt-dlp is the standalone
+    release binary for `TARGETARCH` in `/opt/yt-dlp` (on `PATH`), owned by the non-root user `bot` (uid 10001), so
+    `YTDLP_AUTO_UPDATE` can replace it. `ENTRYPOINT java -XX:MaxRAMPercentage=75 -jar /app/tg-shorts-bot.jar`.
+  - Image is ~1.2 GB, mostly apt ffmpeg and its dependencies (a static ffmpeg build could shrink it; see phase 8).
+- `docker-compose.yml`: service `bot`, `container_name: tg-shorts-bot`, `restart: unless-stopped`, `env_file: .env`,
+  `init: true` (tini reaps ffmpeg orphans of killed downloads), `stop_grace_period: 45s` (the bot waits 30 s for
+  jobs), `./secrets:/app/secrets:ro` for an optional cookies.txt (a directory, so a missing file can't break startup),
+  tmpfs `/tmp/shortsbot` (512 MB, mode 1777), json-file logs capped at 3×10 MB.
+- `.dockerignore` keeps `.env`, `secrets/`, build output and `.git` out of the build context.
+- `README.md`: user-facing setup (BotFather + privacy mode, `.env`, chat id from logs), config table, Instagram
+  cookies, operating, updating yt-dlp, `DownloadCli`, development.
+- Verified: runs as `bot` with tini as PID 1, temp dir and yt-dlp writable, real downloads work, `docker compose restart`
+  shuts down gracefully.
 
 ---
 
@@ -231,7 +209,8 @@ Countries that block Instagram/TikTok/YouTube often block Telegram too.
 ## 8. Hardening & polish (after it all works)
 
 - **Health:** Docker `HEALTHCHECK` on a heartbeat file the poller updates.
-- **yt-dlp freshness:** `YTDLP_AUTO_UPDATE=true` and/or a README note to rebuild regularly.
+- **yt-dlp freshness:** `YTDLP_AUTO_UPDATE=true` exists; maybe a scheduled self-update while running.
+- **Smaller image:** static ffmpeg build instead of apt ffmpeg (~1.2 GB today).
 - **Abuse limits:** per-chat rate limit (e.g. 10 links/min), bounded job queue (drop with a log when full);
   dedupe the same link while it's still in flight.
 - **Too-large fallback:** if a video is > `MAX_FILE_MB`, retry once with `-S "res:480"`.

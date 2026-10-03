@@ -1,0 +1,21 @@
+services:
+  bot:
+    build: .
+    image: tg-shorts-bot:latest
+    container_name: tg-shorts-bot
+    restart: unless-stopped
+    env_file: .env
+    # tini as PID 1 reaps ffmpeg processes orphaned when a download is killed.
+    init: true
+    # The bot gives running downloads 30 s to finish on shutdown.
+    stop_grace_period: 45s
+    volumes:
+      # Optional Instagram cookies: put cookies.txt here and set YTDLP_COOKIES_FILE=/app/secrets/cookies.txt
+      - ./secrets:/app/secrets:ro
+    tmpfs:
+      - /tmp/shortsbot:size=512m,mode=1777
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
