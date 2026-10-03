@@ -57,8 +57,11 @@ tg-shorts-bot/
     │   ├── Main.java
     │   ├── DownloadCli.java                   (debug tool: download links with the bot's settings)
     │   ├── config/BotConfig.java
-    │   ├── telegram/ShortsBot.java            (update consumer)
-    │   ├── telegram/VideoSender.java
+    │   ├── telegram/ShortsBot.java            (update consumer: filters, /help, dispatches links to workers)
+    │   ├── telegram/LinkProcessor.java        (cache → download w/ retry → upload → error reply)
+    │   ├── telegram/ChatGateway.java          (interface over the Telegram calls; faked in tests)
+    │   ├── telegram/TelegramChatGateway.java  (implementation, honors 429 retry_after)
+    │   ├── telegram/ReplyTarget.java, FailureMessages.java
     │   ├── link/Platform.java                 (enum YOUTUBE, INSTAGRAM, TIKTOK)
     │   ├── link/DetectedLink.java             (record: platform, url, canonicalId)
     │   ├── link/LinkExtractor.java
