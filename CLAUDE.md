@@ -18,7 +18,7 @@ Each phase ends with a **Checkpoint** — a concrete thing that must work before
 | Telegram API | `org.telegram:telegrambots-longpolling` + `telegrambots-client` (v9.x) | Mature, plain Java, OkHttp-based → easy to route through a SOCKS proxy later. Long polling = no public URL/HTTPS needed. |
 | Downloading | `yt-dlp` CLI called via `ProcessBuilder` | The only reliable, constantly maintained extractor for all three sites. Reimplementing in Java is a losing battle. |
 | Muxing / re-encoding | `ffmpeg` (used by yt-dlp) | yt-dlp needs it to merge separate video+audio streams into one mp4. |
-| Build | Maven, fat jar via `maven-shade-plugin`; Maven Wrapper (`mvnw`) committed | No Maven installed locally; wrapper + multi-stage Docker build means the host needs only Docker. |
+| Build | Gradle (Kotlin DSL `build.gradle.kts`), fat jar via the Shadow plugin (`com.gradleup.shadow`); Gradle Wrapper (`gradlew`) committed; dependency versions in `gradle/libs.versions.toml` | No Gradle installed locally; wrapper + multi-stage Docker build means the host needs only Docker. |
 | Config | Environment variables (`.env` file read by compose) | Simple, 12-factor, works the same locally and in Docker. |
 | Logging | SLF4J + Logback, console output | `docker compose logs` is the log viewer. |
 | VPN | `sslocal` (shadowsocks-rust) bundled in the image, started by the Java app as a child process when enabled; exposes SOCKS5 on `127.0.0.1:1080` | Outline keys are plain Shadowsocks. One container, one toggle, no compose profiles needed. Java just talks to a local SOCKS5 proxy. |
@@ -38,17 +38,19 @@ Each phase ends with a **Checkpoint** — a concrete thing that must work before
 
 ## 1. Project skeleton
 
-**Goal:** an empty runnable Java app that builds with Maven and in Docker.
+**Goal:** an empty runnable Java app that builds with Gradle and in Docker.
 
 Layout:
 ```
 tg-shorts-bot/
-├── pom.xml
-├── mvnw, mvnw.cmd, .mvn/wrapper/
+├── settings.gradle.kts
+├── build.gradle.kts
+├── gradle/libs.versions.toml
+├── gradlew, gradlew.bat, gradle/wrapper/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .env.example
-├── .gitignore            (.env, cookies.txt, target/, downloads/)
+├── .gitignore            (.env, cookies.txt, build/, .gradle/, downloads/)
 ├── README.md
 └── src/
     ├── main/java/dev/shortsbot/
@@ -73,11 +75,11 @@ tg-shorts-bot/
 
 Steps:
 1. `git init`, `.gitignore`.
-2. `pom.xml`: Java 25 release, dependencies — `telegrambots-longpolling`, `telegrambots-client`, `slf4j-api`, `logback-classic`, `jackson-databind` (for yt-dlp JSON output); test — `junit-jupiter`, `assertj`. Plugins — `maven-surefire`, `maven-shade` (main class `dev.shortsbot.Main`).
-3. Generate the Maven Wrapper (via a throwaway `maven` Docker container: `docker run --rm -v "$PWD":/w -w /w maven:3-eclipse-temurin-25 mvn wrapper:wrapper`).
+2. `settings.gradle.kts` (`rootProject.name = "tg-shorts-bot"`) and `build.gradle.kts`: plugins `application` + `com.gradleup.shadow`; Java toolchain 25; `application.mainClass = "dev.shortsbot.Main"`; dependencies (via version catalog) — `telegrambots-longpolling`, `telegrambots-client`, `slf4j-api`, `logback-classic`, `jackson-databind` (for yt-dlp JSON output); test — `junit-jupiter`, `assertj`, `tasks.test { useJUnitPlatform() }`. `shadowJar` produces `tg-shorts-bot.jar` (no classifier, no version suffix).
+3. Generate the Gradle Wrapper via a throwaway Docker container: `docker run --rm -v "$PWD":/w -w /w gradle:jdk25 gradle wrapper` (or `brew install gradle` once). Commit `gradlew`, `gradlew.bat`, `gradle/wrapper/*`.
 4. `Main.java` that loads config and logs "starting".
 
-**Checkpoint:** `./mvnw -q package` produces `target/tg-shorts-bot.jar`; `java -jar` prints the start log.
+**Checkpoint:** `./gradlew shadowJar` produces `build/libs/tg-shorts-bot.jar`; `java -jar` prints the start log.
 
 ---
 
@@ -128,7 +130,7 @@ Steps:
 
 Unit tests (table-driven): every URL shape above, with/without `www`, tracking params (`?igsh=…`, `?si=…`), trailing slashes, multiple links in one message, unrelated links (regular `youtube.com/watch`, other sites) → ignored.
 
-**Checkpoint:** `./mvnw test` green; bot logs "detected TIKTOK link …" for real messages.
+**Checkpoint:** `./gradlew test` green; bot logs "detected TIKTOK link …" for real messages.
 
 ---
 
@@ -198,7 +200,7 @@ Nice-to-haves for this phase (small, worth doing):
 **Goal:** `docker compose up -d` is the only thing needed.
 
 `Dockerfile` (multi-stage):
-1. **build stage** `maven:3-eclipse-temurin-25` → copy `pom.xml` first, `mvn dependency:go-offline` (layer cache), then sources, `mvn -q package -DskipTests` (tests run in CI / locally).
+1. **build stage** `eclipse-temurin:25-jdk` → copy `gradlew`, `gradle/`, `settings.gradle.kts`, `build.gradle.kts` first and run `./gradlew dependencies --no-daemon` (layer cache), then sources, `./gradlew shadowJar --no-daemon -x test` (tests run in CI / locally). Use a BuildKit cache mount for `/root/.gradle` to speed up rebuilds.
 2. **runtime stage** `eclipse-temurin:25-jre` (Debian-based, so apt works):
    - `apt-get install ffmpeg python3 ca-certificates curl` (+ `xz-utils` for phase 7),
    - install yt-dlp as the official standalone binary from GitHub releases (`yt-dlp_linux` / `yt-dlp_linux_aarch64` chosen by `TARGETARCH`) → `/usr/local/bin/yt-dlp`,
@@ -278,13 +280,13 @@ Still a single `docker compose up -d`.
 - **Abuse limits:** per-chat rate limit (e.g. 10 links/minute), max queue size — drop with a log when full.
 - **Too-large fallback:** if > 49 MB, retry once with `-S "res:480"`; still too big → polite refusal.
 - **Optional features** (only if you want them): delete the original message after posting (needs admin rights; config flag), caption with the original poster's name, support for Instagram carousels / TikTok photo posts via `sendMediaGroup`, persistent file_id cache (simple JSON file on a volume).
-- **CI:** GitHub Actions running `./mvnw verify` and `docker build`.
+- **CI:** GitHub Actions running `./gradlew build` and `docker build`.
 
 ---
 
 ## Order of execution (summary)
 
-1. Skeleton + Maven wrapper → builds.
+1. Skeleton + Gradle wrapper → builds.
 2. Config + bot receives group messages.
 3. Link extractor + tests.
 4. yt-dlp downloader + tests.
