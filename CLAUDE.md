@@ -58,7 +58,7 @@ tg-shorts-bot/
     │   ├── config/BotConfig.java
     │   ├── telegram/ShortsBot.java            (update consumer)
     │   ├── telegram/VideoSender.java
-    │   ├── link/Platform.java                 (enum YOUTUBE_SHORTS, INSTAGRAM_REEL, TIKTOK)
+    │   ├── link/Platform.java                 (enum YOUTUBE, INSTAGRAM, TIKTOK)
     │   ├── link/DetectedLink.java             (record: platform, url, canonicalId)
     │   ├── link/LinkExtractor.java
     │   ├── download/VideoDownloader.java      (interface)

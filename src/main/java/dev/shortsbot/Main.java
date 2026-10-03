@@ -2,6 +2,7 @@ package dev.shortsbot;
 
 import dev.shortsbot.config.BotConfig;
 import dev.shortsbot.config.ConfigException;
+import dev.shortsbot.link.LinkExtractor;
 import dev.shortsbot.telegram.ShortsBot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -47,7 +48,7 @@ public final class Main {
         TelegramClient telegramClient = new OkHttpTelegramClient(config.botToken());
         logBotIdentity(telegramClient);
 
-        var bot = new ShortsBot(config);
+        var bot = new ShortsBot(config, new LinkExtractor());
         var application = new TelegramBotsLongPollingApplication();
         application.registerBot(config.botToken(), bot);
         log.info("Bot is running; waiting for messages");

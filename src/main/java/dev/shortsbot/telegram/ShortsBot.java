@@ -1,6 +1,8 @@
 package dev.shortsbot.telegram;
 
 import dev.shortsbot.config.BotConfig;
+import dev.shortsbot.link.DetectedLink;
+import dev.shortsbot.link.LinkExtractor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.telegram.telegrambots.longpolling.util.DefaultLongPollingUpdateConsumer;
@@ -12,17 +14,19 @@ import org.telegram.telegrambots.meta.api.objects.message.Message;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-/** Receives updates from Telegram. For now it only logs incoming messages. */
+/** Receives updates from Telegram. For now it only logs incoming messages and the video links found in them. */
 public class ShortsBot extends DefaultLongPollingUpdateConsumer {
 
     private static final Logger log = LoggerFactory.getLogger(ShortsBot.class);
     private static final int MAX_LOGGED_TEXT_LENGTH = 200;
 
     private final BotConfig config;
+    private final LinkExtractor linkExtractor;
     private final Set<Long> reportedIgnoredChats = ConcurrentHashMap.newKeySet();
 
-    public ShortsBot(BotConfig config) {
+    public ShortsBot(BotConfig config, LinkExtractor linkExtractor) {
         this.config = config;
+        this.linkExtractor = linkExtractor;
     }
 
     @Override
@@ -49,6 +53,10 @@ public class ShortsBot extends DefaultLongPollingUpdateConsumer {
         String text = message.hasText() ? message.getText() : message.getCaption();
         log.info("Message in chat {} ({} '{}') from {}: {}",
                 chat.getId(), chat.getType(), describe(chat), describe(message.getFrom()), abbreviate(text));
+
+        for (DetectedLink link : linkExtractor.extract(message)) {
+            log.info("Detected {} link {} ({})", link.platform(), link.url(), link.canonicalId());
+        }
     }
 
     private static String describe(Chat chat) {
